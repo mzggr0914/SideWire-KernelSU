@@ -8,6 +8,7 @@ use std::{
     },
 };
 use tokio::{
+    io::AsyncWriteExt,
     net::{TcpStream, tcp::OwnedWriteHalf},
     sync::{Mutex, Notify, mpsc},
 };
@@ -80,6 +81,18 @@ impl DeviceTransport {
 
     pub(super) fn same_connection(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn close(&self) {
+        if !self.inner.closed.swap(true, Ordering::AcqRel) {
+            let mut writer = self.inner.writer.lock().await;
+            let _ = writer.shutdown().await;
+            self.inner.closed_notify.notify_waiters();
+        }
     }
 
     pub(super) async fn send_frame(&self, frame: &Frame) -> Result<()> {

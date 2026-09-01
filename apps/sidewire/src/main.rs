@@ -81,10 +81,14 @@ enum Command {
     Doctor {
         #[arg(long, default_value = DEFAULT_CONTROL)]
         control: String,
+        #[arg(short = 's', long)]
+        device: Option<String>,
     },
     WaitForDevice {
         #[arg(long, default_value = DEFAULT_CONTROL)]
         control: String,
+        #[arg(short = 's', long)]
+        device: Option<String>,
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
@@ -101,6 +105,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
+        #[arg(long)]
+        all: bool,
         #[arg(long = "as", value_enum)]
         run_as: Option<RunAs>,
         program: String,
@@ -125,6 +131,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
+        #[arg(long)]
+        all: bool,
         #[arg(long = "as", value_enum)]
         run_as: Option<RunAs>,
         local: PathBuf,
@@ -251,11 +259,7 @@ async fn main() -> Result<()> {
             mut connect,
             discover,
         } => {
-            if discover && !connect.is_empty() {
-                bail!("use either --connect or --discover, not both");
-            }
             if connect.is_empty()
-                && !discover
                 && let Some(endpoint) = app_config.connect.clone()
             {
                 connect.push(endpoint);
@@ -263,31 +267,56 @@ async fn main() -> Result<()> {
             server::run_server(&bind, &control, connect, discover).await
         }
         Command::Discover { timeout_ms } => discovery::run_discover(timeout_ms).await,
-        Command::Doctor { control } => client::run_doctor(&control, &app_config).await,
-        Command::WaitForDevice { control, timeout } => {
-            client::run_wait_for_device(&control, timeout).await
+        Command::Doctor { control, device } => {
+            client::run_doctor(
+                &control,
+                config::resolve_device(&app_config, device),
+                &app_config,
+            )
+            .await
+        }
+        Command::WaitForDevice {
+            control,
+            device,
+            timeout,
+        } => {
+            client::run_wait_for_device(
+                &control,
+                config::resolve_device(&app_config, device),
+                timeout,
+            )
+            .await
         }
         Command::Config { command } => match command {
             ConfigCommand::Show => config::show(),
             ConfigCommand::Set { key, value } => config::set(&key, &value),
             ConfigCommand::Unset { key } => config::unset(&key),
         },
-        Command::Devices { control } => client::run_devices(&control).await,
+        Command::Devices { control } => client::run_devices(&control, &app_config).await,
         Command::Exec {
             control,
             device,
+            all,
             run_as,
             program,
             args,
         } => {
-            client::run_exec_client(
-                &control,
-                device,
-                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
-                program,
-                args,
-            )
-            .await
+            if all && device.is_some() {
+                bail!("--all cannot be combined with -s/--device");
+            }
+            let run_as = config::resolve_run_as(&app_config, run_as, RunAs::Shell);
+            if all {
+                client::run_exec_all(&control, run_as, program, args).await
+            } else {
+                client::run_exec_client(
+                    &control,
+                    config::resolve_device(&app_config, device),
+                    run_as,
+                    program,
+                    args,
+                )
+                .await
+            }
         }
         Command::Shell {
             control,
@@ -298,7 +327,7 @@ async fn main() -> Result<()> {
         } => {
             pty::run_shell(
                 &control,
-                device,
+                config::resolve_device(&app_config, device),
                 config::resolve_run_as(&app_config, run_as, RunAs::Shell),
                 raw,
                 probe,
@@ -308,18 +337,27 @@ async fn main() -> Result<()> {
         Command::Push {
             control,
             device,
+            all,
             run_as,
             local,
             remote,
         } => {
-            transfer::run_push(
-                &control,
-                device,
-                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
-                local,
-                remote,
-            )
-            .await
+            if all && device.is_some() {
+                bail!("--all cannot be combined with -s/--device");
+            }
+            let run_as = config::resolve_run_as(&app_config, run_as, RunAs::Shell);
+            if all {
+                transfer::run_push_all(&control, run_as, local, remote).await
+            } else {
+                transfer::run_push(
+                    &control,
+                    config::resolve_device(&app_config, device),
+                    run_as,
+                    local,
+                    remote,
+                )
+                .await
+            }
         }
         Command::Pull {
             control,
@@ -330,7 +368,7 @@ async fn main() -> Result<()> {
         } => {
             transfer::run_pull(
                 &control,
-                device,
+                config::resolve_device(&app_config, device),
                 config::resolve_run_as(&app_config, run_as, RunAs::Shell),
                 remote,
                 local,
@@ -345,7 +383,7 @@ async fn main() -> Result<()> {
         } => {
             client::run_install(
                 &control,
-                device,
+                config::resolve_device(&app_config, device),
                 config::resolve_run_as(&app_config, run_as, RunAs::Shell),
                 apk,
             )
@@ -359,7 +397,7 @@ async fn main() -> Result<()> {
         } => {
             client::run_exec_checked(
                 &control,
-                device,
+                config::resolve_device(&app_config, device),
                 config::resolve_run_as(&app_config, run_as, RunAs::Shell),
                 "/system/bin/pm",
                 vec!["uninstall".into(), package],
@@ -375,7 +413,7 @@ async fn main() -> Result<()> {
         } => {
             client::run_logcat(
                 &control,
-                device,
+                config::resolve_device(&app_config, device),
                 config::resolve_run_as(&app_config, run_as, RunAs::Shell),
                 clear,
                 args,
@@ -387,13 +425,29 @@ async fn main() -> Result<()> {
             device,
             local,
             remote,
-        } => client::run_forward(&control, device, local, remote).await,
+        } => {
+            client::run_forward(
+                &control,
+                config::resolve_device(&app_config, device),
+                local,
+                remote,
+            )
+            .await
+        }
         Command::Reverse {
             control,
             device,
             remote,
             local,
-        } => client::run_reverse(&control, device, remote, local).await,
+        } => {
+            client::run_reverse(
+                &control,
+                config::resolve_device(&app_config, device),
+                remote,
+                local,
+            )
+            .await
+        }
         Command::Reboot {
             control,
             device,
@@ -402,7 +456,7 @@ async fn main() -> Result<()> {
         } => {
             client::run_reboot(
                 &control,
-                device,
+                config::resolve_device(&app_config, device),
                 config::resolve_run_as(&app_config, run_as, RunAs::Root),
                 target,
             )
@@ -416,7 +470,7 @@ async fn main() -> Result<()> {
         } => {
             client::run_screencap(
                 &control,
-                device,
+                config::resolve_device(&app_config, device),
                 config::resolve_run_as(&app_config, run_as, RunAs::Shell),
                 output,
             )
@@ -430,7 +484,7 @@ async fn main() -> Result<()> {
         } => {
             client::run_packages(
                 &control,
-                device,
+                config::resolve_device(&app_config, device),
                 config::resolve_run_as(&app_config, run_as, RunAs::Shell),
                 filter,
             )
@@ -444,7 +498,7 @@ async fn main() -> Result<()> {
         } => {
             client::run_app(
                 &control,
-                device,
+                config::resolve_device(&app_config, device),
                 config::resolve_run_as(&app_config, run_as, RunAs::Shell),
                 command,
             )

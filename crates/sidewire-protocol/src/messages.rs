@@ -1,7 +1,9 @@
+use crate::DeviceId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Hello {
+    pub device_id: Option<DeviceId>,
     pub name: String,
     pub role: PeerRole,
     pub protocol_version: u16,
@@ -15,6 +17,7 @@ pub enum PeerRole {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HelloAck {
+    pub device_id: Option<DeviceId>,
     pub name: String,
     pub os: String,
     pub arch: String,

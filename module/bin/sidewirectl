@@ -14,7 +14,13 @@ write_config(){
   host="$(get host)"; [ -n "$host" ] || host=127.0.0.1
   port="$(get port)"; [ -n "$port" ] || port=58321
   name="$(get name)"; [ -n "$name" ] || name="$(getprop ro.product.model)"
-  { echo "mode=$mode"; echo "host=$host"; echo "port=$port"; echo "name=$name"; } > "$CONFIG"
+  device_id="$(get device_id)"
+  if [ -z "$device_id" ]; then
+    device_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')"
+    [ -n "$device_id" ] || device_id="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    setv device_id "$device_id"
+  fi
+  { echo "mode=$mode"; echo "host=$host"; echo "port=$port"; echo "name=$name"; echo "device_id=$device_id"; } > "$CONFIG"
   chmod 0600 "$CONFIG"
 }
 start_daemon(){

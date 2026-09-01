@@ -1,22 +1,44 @@
 use super::*;
 use crate::transport::DeviceTransport;
+use sidewire_protocol::DeviceId;
+use std::collections::HashSet;
 
 const FILE_BUFFER_SIZE: usize = 256 * 1024;
 const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 
+#[derive(Clone, Copy, Debug)]
+enum ConnectionMode {
+    Inbound,
+    Outbound,
+}
+
+impl ConnectionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DeviceSession {
+    id: DeviceId,
+    name: String,
     pub(super) peer: String,
+    mode: ConnectionMode,
     device_ip: IpAddr,
     local_ip: IpAddr,
     transport: DeviceTransport,
 }
 
-type DeviceMap = Arc<RwLock<HashMap<String, DeviceSession>>>;
-#[derive(Debug, Serialize, Deserialize)]
+type DeviceMap = Arc<RwLock<HashMap<DeviceId, DeviceSession>>>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct DeviceInfo {
+    pub(super) id: String,
     pub(super) name: String,
     pub(super) peer: String,
+    pub(super) mode: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -124,7 +146,7 @@ pub(super) async fn run_server(
     if discover {
         let devices = devices.clone();
         tokio::spawn(async move {
-            discovered_device_connector(devices).await;
+            discovered_device_manager(devices).await;
         });
     }
 
@@ -146,44 +168,56 @@ async fn device_listener(bind: &str, devices: DeviceMap) -> Result<()> {
         let device_ip = peer.ip();
         let local_ip = stream.local_addr()?.ip();
         match accept_device(&mut stream).await {
-            Ok(name) => {
-                tracing::info!(device = %name, peer = %peer_text, "device connected");
+            Ok(identity) => {
                 let transport = DeviceTransport::new(stream);
                 let session = DeviceSession {
+                    id: identity.id,
+                    name: identity.name,
                     peer: peer_text,
+                    mode: ConnectionMode::Outbound,
                     device_ip,
                     local_ip,
                     transport: transport.clone(),
                 };
-                devices.write().await.insert(name.clone(), session.clone());
-                let devices = devices.clone();
-                tokio::spawn(async move {
-                    transport.wait_closed().await;
-                    remove_device_if_same(&devices, &name, &session).await;
-                });
+                if let Err(error) = register_device(&devices, session).await {
+                    tracing::warn!(%peer, %error, "outbound device rejected");
+                }
             }
             Err(error) => tracing::warn!(%peer, %error, "device handshake failed"),
         }
     }
 }
 
-async fn accept_device(stream: &mut TcpStream) -> Result<String> {
+struct DeviceIdentity {
+    id: DeviceId,
+    name: String,
+}
+
+async fn accept_device(stream: &mut TcpStream) -> Result<DeviceIdentity> {
     let hello_frame = read_frame(stream).await?;
     if hello_frame.kind != FrameKind::Hello {
         bail!("expected device Hello");
     }
     let hello: Hello = decode(&hello_frame.payload)?;
+    let id = hello
+        .device_id
+        .context("device Hello did not include device_id")?;
     let ack = HelloAck {
+        device_id: None,
         name: "sidewire-server".into(),
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
     };
     write_frame(stream, &frame(FrameKind::HelloAck, 0, &ack)?).await?;
-    Ok(hello.name)
+    Ok(DeviceIdentity {
+        id,
+        name: hello.name,
+    })
 }
 
-async fn connect_device(stream: &mut TcpStream) -> Result<String> {
+async fn connect_device(stream: &mut TcpStream) -> Result<DeviceIdentity> {
     let hello = Hello {
+        device_id: None,
         name: "sidewire-server".into(),
         role: sidewire_protocol::PeerRole::Host,
         protocol_version: sidewire_protocol::VERSION,
@@ -194,13 +228,56 @@ async fn connect_device(stream: &mut TcpStream) -> Result<String> {
         bail!("expected device HelloAck");
     }
     let ack: HelloAck = decode(&ack_frame.payload)?;
+    let id = ack
+        .device_id
+        .context("device HelloAck did not include device_id")?;
     if ack.name.trim().is_empty() {
         bail!("device returned an empty name");
     }
-    Ok(ack.name)
+    Ok(DeviceIdentity { id, name: ack.name })
 }
 
-async fn connect_endpoint_once(endpoint: &str, devices: &DeviceMap) -> Result<()> {
+async fn register_device(devices: &DeviceMap, session: DeviceSession) -> Result<()> {
+    let id = session.id;
+    let name = session.name.clone();
+    let mode = session.mode;
+    let peer = session.peer.clone();
+    let monitor = session.clone();
+    let conflict = {
+        let mut guard = devices.write().await;
+        if let Some(existing) = guard.get(&id)
+            && !existing.transport.is_closed()
+        {
+            Some(format!(
+                "device {} ({}) is already connected via {} from {}",
+                existing.name,
+                id.short(),
+                existing.mode.as_str(),
+                existing.peer
+            ))
+        } else {
+            guard.insert(id, session);
+            None
+        }
+    };
+    if let Some(message) = conflict {
+        monitor.transport.close().await;
+        bail!(message);
+    }
+    tracing::info!(device = %name, device_id = %id.short(), mode = mode.as_str(), %peer, "device connected");
+    let devices = devices.clone();
+    tokio::spawn(async move {
+        monitor.transport.wait_closed().await;
+        remove_device_if_same(&devices, id, &monitor).await;
+    });
+    Ok(())
+}
+
+async fn connect_endpoint_once(
+    endpoint: &str,
+    expected_id: Option<DeviceId>,
+    devices: &DeviceMap,
+) -> Result<()> {
     tracing::info!(%endpoint, "connecting to inbound SideWire device");
     let mut stream = TcpStream::connect(endpoint)
         .await
@@ -208,27 +285,35 @@ async fn connect_endpoint_once(endpoint: &str, devices: &DeviceMap) -> Result<()
     stream.set_nodelay(true).context("enable TCP_NODELAY")?;
     let peer = stream.peer_addr()?;
     let local = stream.local_addr()?;
-    let name = connect_device(&mut stream).await?;
-    let peer_text = peer.to_string();
-    tracing::info!(device = %name, peer = %peer_text, %endpoint, "inbound device connected");
+    let identity = connect_device(&mut stream).await?;
+    if let Some(expected) = expected_id
+        && identity.id != expected
+    {
+        bail!(
+            "discovery identity changed at {endpoint}: expected {}, got {}",
+            expected.short(),
+            identity.id.short()
+        );
+    }
     let transport = DeviceTransport::new(stream);
     let session = DeviceSession {
-        peer: peer_text,
+        id: identity.id,
+        name: identity.name,
+        peer: peer.to_string(),
+        mode: ConnectionMode::Inbound,
         device_ip: peer.ip(),
         local_ip: local.ip(),
         transport: transport.clone(),
     };
-    devices.write().await.insert(name.clone(), session.clone());
+    register_device(devices, session).await?;
     transport.wait_closed().await;
-    remove_device_if_same(devices, &name, &session).await;
-    tracing::warn!(device = %name, %endpoint, "inbound device connection ended");
     Ok(())
 }
 
 async fn device_connector(endpoint: String, devices: DeviceMap) {
     let mut delay = 1u64;
     loop {
-        match connect_endpoint_once(&endpoint, &devices).await {
+        match connect_endpoint_once(&endpoint, None, &devices).await {
             Ok(()) => delay = 1,
             Err(error) => tracing::warn!(%endpoint, %error, "inbound device connect failed"),
         }
@@ -237,25 +322,74 @@ async fn device_connector(endpoint: String, devices: DeviceMap) {
     }
 }
 
-async fn discovered_device_connector(devices: DeviceMap) {
+async fn discovered_device_connector(
+    device_id: DeviceId,
+    endpoints: Arc<RwLock<HashMap<DeviceId, String>>>,
+    devices: DeviceMap,
+) {
+    let mut delay = 1u64;
     loop {
-        match crate::discovery::discover_one(tokio::time::Duration::from_millis(1500)).await {
-            Ok(Some(found)) if found.protocol_version == sidewire_protocol::VERSION => {
-                let endpoint = found.endpoint;
-                if let Err(error) = connect_endpoint_once(&endpoint, &devices).await {
-                    tracing::warn!(%endpoint, %error, "discovered device connection failed");
+        let connected = devices
+            .read()
+            .await
+            .get(&device_id)
+            .is_some_and(|session| !session.transport.is_closed());
+        if connected {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            delay = 1;
+            continue;
+        }
+        let endpoint = endpoints.read().await.get(&device_id).cloned();
+        let Some(endpoint) = endpoint else {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            continue;
+        };
+        match connect_endpoint_once(&endpoint, Some(device_id), &devices).await {
+            Ok(()) => delay = 1,
+            Err(error) => {
+                tracing::debug!(device_id = %device_id.short(), %endpoint, %error, "discovered device connect failed")
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+        delay = (delay * 2).min(10);
+    }
+}
+
+async fn discovered_device_manager(devices: DeviceMap) {
+    let endpoints = Arc::new(RwLock::new(HashMap::<DeviceId, String>::new()));
+    let mut started = HashSet::new();
+    loop {
+        match crate::discovery::discover_all(tokio::time::Duration::from_millis(1200)).await {
+            Ok(found) => {
+                for device in found {
+                    if device.protocol_version != sidewire_protocol::VERSION {
+                        tracing::warn!(
+                            device = %device.name,
+                            device_id = %device.device_id.short(),
+                            device_protocol = device.protocol_version,
+                            host_protocol = sidewire_protocol::VERSION,
+                            "ignoring discovered device with incompatible protocol"
+                        );
+                        continue;
+                    }
+                    endpoints
+                        .write()
+                        .await
+                        .insert(device.device_id, device.endpoint.clone());
+                    if started.insert(device.device_id) {
+                        let endpoints = endpoints.clone();
+                        let devices = devices.clone();
+                        tokio::spawn(discovered_device_connector(
+                            device.device_id,
+                            endpoints,
+                            devices,
+                        ));
+                    }
                 }
             }
-            Ok(Some(found)) => tracing::warn!(
-                device = %found.name,
-                device_protocol = found.protocol_version,
-                host_protocol = sidewire_protocol::VERSION,
-                "ignoring discovered device with incompatible protocol"
-            ),
-            Ok(None) => {}
             Err(error) => tracing::debug!(%error, "SideWire discovery failed"),
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
     }
 }
 
@@ -333,7 +467,17 @@ async fn handle_control_exec_stream(
     cwd: Option<String>,
     run_as: RunAs,
 ) -> Result<()> {
-    let (_, session) = resolve_device(devices, device.as_deref()).await?;
+    let (_, session) = match resolve_device(devices, device.as_deref()).await {
+        Ok(selected) => selected,
+        Err(error) => {
+            let mut encoded = serde_json::to_vec(&ControlResponse::Error {
+                message: error.to_string(),
+            })?;
+            encoded.push(b'\n');
+            reader.get_mut().write_all(&encoded).await?;
+            return Ok(());
+        }
+    };
     let mut remote = session.transport.open_stream().await?;
     let stream_id = remote.id();
     let request = ExecRequest {
@@ -379,7 +523,17 @@ async fn handle_control_pty(
         term,
         echo,
     } = options;
-    let (_, session) = resolve_device(devices, device.as_deref()).await?;
+    let (_, session) = match resolve_device(devices, device.as_deref()).await {
+        Ok(selected) => selected,
+        Err(error) => {
+            let mut encoded = serde_json::to_vec(&ControlResponse::Error {
+                message: error.to_string(),
+            })?;
+            encoded.push(b'\n');
+            reader.get_mut().write_all(&encoded).await?;
+            return Ok(());
+        }
+    };
     let mut device_stream = session.transport.open_stream().await?;
     let stream_id = device_stream.id();
     let request = PtyOpenRequest {
@@ -484,12 +638,14 @@ async fn process_control(request: ControlRequest, devices: &DeviceMap) -> Contro
             let guard = devices.read().await;
             let mut list: Vec<DeviceInfo> = guard
                 .iter()
-                .map(|(name, session)| DeviceInfo {
-                    name: name.clone(),
+                .map(|(id, session)| DeviceInfo {
+                    id: id.to_hex(),
+                    name: session.name.clone(),
                     peer: session.peer.clone(),
+                    mode: session.mode.as_str().to_owned(),
                 })
                 .collect();
-            list.sort_by(|a, b| a.name.cmp(&b.name));
+            list.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
             ControlResponse::Devices { devices: list }
         }
         ControlRequest::Ping { device } => match resolve_device(devices, device.as_deref()).await {
@@ -599,41 +755,76 @@ async fn process_control(request: ControlRequest, devices: &DeviceMap) -> Contro
     }
 }
 
+fn selector_is_id_prefix(selector: &str) -> bool {
+    let compact = selector.replace('-', "").to_ascii_lowercase();
+    compact.len() >= 4 && compact.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn selector_matches_id(id: DeviceId, selector: &str) -> bool {
+    if !selector_is_id_prefix(selector) {
+        return false;
+    }
+    id.to_hex()
+        .starts_with(&selector.replace('-', "").to_ascii_lowercase())
+}
+
 async fn resolve_device(
     devices: &DeviceMap,
     requested: Option<&str>,
-) -> Result<(String, DeviceSession)> {
+) -> Result<(DeviceId, DeviceSession)> {
     let guard = devices.read().await;
-    if let Some(name) = requested {
-        let session = guard
-            .get(name)
-            .cloned()
-            .with_context(|| format!("device '{name}' is not connected"))?;
-        return Ok((name.to_owned(), session));
+    if let Some(selector) = requested {
+        let mut matches: Vec<_> = guard
+            .iter()
+            .filter(|(id, _)| selector_matches_id(**id, selector))
+            .map(|(id, session)| (*id, session.clone()))
+            .collect();
+        if matches.is_empty() {
+            matches = guard
+                .iter()
+                .filter(|(_, session)| session.name.eq_ignore_ascii_case(selector))
+                .map(|(id, session)| (*id, session.clone()))
+                .collect();
+        }
+        match matches.len() {
+            1 => return Ok(matches.pop().unwrap()),
+            0 => bail!("device selector '{selector}' did not match any connected device"),
+            _ => {
+                let choices = matches
+                    .iter()
+                    .map(|(id, session)| format!("{}:{}", id.short(), session.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!("device selector '{selector}' is ambiguous: {choices}; use an ID prefix");
+            }
+        }
     }
 
     match guard.len() {
         0 => bail!("no SideWire devices connected"),
         1 => {
-            let (name, session) = guard.iter().next().unwrap();
-            Ok((name.clone(), session.clone()))
+            let (id, session) = guard.iter().next().unwrap();
+            Ok((*id, session.clone()))
         }
-        _ => bail!("multiple devices connected; select one with -s <name>"),
+        _ => bail!(
+            "multiple devices connected; select one with -s <name-or-id> or configure default-device"
+        ),
     }
 }
 
-async fn remove_device_if_same(devices: &DeviceMap, name: &str, session: &DeviceSession) {
+async fn remove_device_if_same(devices: &DeviceMap, id: DeviceId, session: &DeviceSession) {
     let should_remove = devices
         .read()
         .await
-        .get(name)
+        .get(&id)
         .map(|current| current.transport.same_connection(&session.transport))
         .unwrap_or(false);
     if should_remove {
-        devices.write().await.remove(name);
-        tracing::info!(device = %name, "device disconnected");
+        devices.write().await.remove(&id);
+        tracing::info!(device = %session.name, device_id = %id.short(), "device disconnected");
     }
 }
+
 async fn remote_ping(session: &DeviceSession) -> Result<u64> {
     let mut stream = session.transport.open_stream().await?;
     let nonce = rand::random::<[u8; 8]>();

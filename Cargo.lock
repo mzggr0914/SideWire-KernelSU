@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "sidewire"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "sidewire-protocol"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "postcard",
@@ -634,11 +634,12 @@ dependencies = [
 
 [[package]]
 name = "sidewired"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "rand",
  "sidewire-protocol",
  "tokio",
  "tracing",

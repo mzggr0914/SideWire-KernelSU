@@ -22,36 +22,98 @@ pub(super) async fn request_control(
     Ok(serde_json::from_str(line.trim_end())?)
 }
 
-pub(super) async fn run_devices(control: &str) -> Result<()> {
+pub(super) async fn list_devices(control: &str) -> Result<Vec<server::DeviceInfo>> {
     match request_control(control, &ControlRequest::Devices).await? {
-        ControlResponse::Devices { devices } => {
-            if devices.is_empty() {
-                println!("No devices connected.");
-            } else {
-                println!("NAME\tPEER");
-                for device in devices {
-                    println!("{}\t{}", device.name, device.peer);
-                }
-            }
-            Ok(())
-        }
+        ControlResponse::Devices { devices } => Ok(devices),
         ControlResponse::Error { message } => bail!(message),
         _ => bail!("unexpected server response"),
     }
 }
-pub(super) async fn run_wait_for_device(control: &str, timeout_secs: u64) -> Result<()> {
+
+fn selector_matches(device: &server::DeviceInfo, selector: &str) -> bool {
+    let compact = selector.replace('-', "").to_ascii_lowercase();
+    let id_match = compact.len() >= 4
+        && compact.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && device.id.starts_with(&compact);
+    id_match || device.name.eq_ignore_ascii_case(selector)
+}
+
+fn select_device<'a>(
+    devices: &'a [server::DeviceInfo],
+    selector: Option<&str>,
+) -> Result<&'a server::DeviceInfo> {
+    if let Some(selector) = selector {
+        let matches: Vec<_> = devices
+            .iter()
+            .filter(|device| selector_matches(device, selector))
+            .collect();
+        return match matches.len() {
+            1 => Ok(matches[0]),
+            0 => bail!("device selector '{selector}' did not match any connected device"),
+            _ => bail!("device selector '{selector}' is ambiguous; use an ID prefix"),
+        };
+    }
+    match devices.len() {
+        0 => bail!("no SideWire devices connected"),
+        1 => Ok(&devices[0]),
+        _ => bail!(
+            "multiple devices connected; select one with -s <name-or-id> or configure default-device"
+        ),
+    }
+}
+
+pub(super) async fn run_devices(control: &str, config: &crate::config::AppConfig) -> Result<()> {
+    let devices = list_devices(control).await?;
+    if devices.is_empty() {
+        println!("No devices connected.");
+        return Ok(());
+    }
+    let default_matches = config.default_device.as_deref().map(|selector| {
+        devices
+            .iter()
+            .filter(|device| selector_matches(device, selector))
+            .count()
+    });
+    println!("DEFAULT\tID\tNAME\tMODE\tPEER");
+    for device in devices {
+        let is_default = config.default_device.as_deref().is_some_and(|selector| {
+            default_matches == Some(1) && selector_matches(&device, selector)
+        });
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            if is_default { "*" } else { "" },
+            &device.id[..8],
+            device.name,
+            device.mode,
+            device.peer
+        );
+    }
+    Ok(())
+}
+
+pub(super) async fn run_wait_for_device(
+    control: &str,
+    selector: Option<String>,
+    timeout_secs: u64,
+) -> Result<()> {
     let started = tokio::time::Instant::now();
     let timeout = (timeout_secs != 0).then(|| tokio::time::Duration::from_secs(timeout_secs));
     loop {
-        let last_error = match request_control(control, &ControlRequest::Devices).await {
-            Ok(ControlResponse::Devices { devices }) if !devices.is_empty() => {
-                let device = &devices[0];
-                println!("{}\t{}", device.name, device.peer);
-                return Ok(());
+        let last_error = match list_devices(control).await {
+            Ok(devices) => {
+                let selected = if selector.is_some() {
+                    select_device(&devices, selector.as_deref())
+                } else {
+                    devices.first().context("no device connected")
+                };
+                match selected {
+                    Ok(device) => {
+                        println!("{}\t{}\t{}", &device.id[..8], device.name, device.peer);
+                        return Ok(());
+                    }
+                    Err(error) => error.to_string(),
+                }
             }
-            Ok(ControlResponse::Devices { .. }) => "no device connected".to_owned(),
-            Ok(ControlResponse::Error { message }) => message,
-            Ok(_) => "unexpected server response".to_owned(),
             Err(error) => error.to_string(),
         };
         if timeout.is_some_and(|limit| started.elapsed() >= limit) {
@@ -61,7 +123,11 @@ pub(super) async fn run_wait_for_device(control: &str, timeout_secs: u64) -> Res
     }
 }
 
-pub(super) async fn run_doctor(control: &str, app_config: &crate::config::AppConfig) -> Result<()> {
+pub(super) async fn run_doctor(
+    control: &str,
+    selector: Option<String>,
+    app_config: &crate::config::AppConfig,
+) -> Result<()> {
     println!("SideWire CLI\t{}", env!("CARGO_PKG_VERSION"));
     println!("Protocol\t{}", sidewire_protocol::VERSION);
     println!("Control\t{control}");
@@ -70,35 +136,32 @@ pub(super) async fn run_doctor(control: &str, app_config: &crate::config::AppCon
         "Configured connect\t{}",
         app_config.connect.as_deref().unwrap_or("(none)")
     );
-    let default_identity = match app_config.run_as {
-        Some(RunAs::Root) => "root",
-        Some(RunAs::Shell) => "shell",
-        None => "shell",
-    };
-    println!("Default identity\t{default_identity}");
+    println!(
+        "Default device\t{}",
+        app_config.default_device.as_deref().unwrap_or("(none)")
+    );
+    let devices = list_devices(control).await?;
+    let device = select_device(&devices, selector.as_deref())?;
+    let exact = device.id.clone();
+    println!("Device\t{} [{}]", device.name, &device.id[..8]);
+    println!("Mode\t{}", device.mode);
+    println!("Peer\t{}", device.peer);
 
-    let devices = match request_control(control, &ControlRequest::Devices).await? {
-        ControlResponse::Devices { devices } => devices,
-        ControlResponse::Error { message } => bail!(message),
-        _ => bail!("unexpected devices response"),
-    };
-    if devices.is_empty() {
-        bail!("local server is reachable, but no SideWire device is connected");
-    }
-    if devices.len() != 1 {
-        bail!("doctor currently expects one connected device");
-    }
-    println!("Device\t{} ({})", devices[0].name, devices[0].peer);
-
-    match request_control(control, &ControlRequest::Ping { device: None }).await? {
+    match request_control(
+        control,
+        &ControlRequest::Ping {
+            device: Some(exact.clone()),
+        },
+    )
+    .await?
+    {
         ControlResponse::Pong { latency_ms } => println!("Round trip\t{latency_ms} ms"),
         ControlResponse::Error { message } => bail!(message),
         _ => bail!("unexpected ping response"),
     }
-
     let (model, _, model_code) = exec_control(
         control,
-        None,
+        Some(exact.clone()),
         RunAs::Shell,
         "/system/bin/getprop",
         vec!["ro.product.model".into()],
@@ -106,7 +169,7 @@ pub(super) async fn run_doctor(control: &str, app_config: &crate::config::AppCon
     .await?;
     let (android, _, android_code) = exec_control(
         control,
-        None,
+        Some(exact.clone()),
         RunAs::Shell,
         "/system/bin/getprop",
         vec!["ro.build.version.release".into()],
@@ -118,17 +181,74 @@ pub(super) async fn run_doctor(control: &str, app_config: &crate::config::AppCon
     if android_code == Some(0) {
         println!("Android\t{}", android.trim());
     }
-
-    let (_, _, shell_code) =
-        exec_control(control, None, RunAs::Shell, "/system/bin/id", Vec::new()).await?;
+    let (_, _, shell_code) = exec_control(
+        control,
+        Some(exact.clone()),
+        RunAs::Shell,
+        "/system/bin/id",
+        Vec::new(),
+    )
+    .await?;
     println!(
         "Shell identity\t{}",
         if shell_code == Some(0) { "OK" } else { "FAIL" }
     );
-    let root_ok = exec_control(control, None, RunAs::Root, "/system/bin/id", Vec::new())
-        .await
-        .is_ok_and(|(_, _, code)| code == Some(0));
+    let root_ok = exec_control(
+        control,
+        Some(exact),
+        RunAs::Root,
+        "/system/bin/id",
+        Vec::new(),
+    )
+    .await
+    .is_ok_and(|(_, _, code)| code == Some(0));
     println!("Root identity\t{}", if root_ok { "OK" } else { "FAIL" });
+    Ok(())
+}
+
+pub(super) async fn run_exec_all(
+    control: &str,
+    run_as: RunAs,
+    program: String,
+    args: Vec<String>,
+) -> Result<()> {
+    let devices = list_devices(control).await?;
+    if devices.is_empty() {
+        bail!("no SideWire devices connected");
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for device in devices {
+        let control = control.to_owned();
+        let program = program.clone();
+        let args = args.clone();
+        tasks.spawn(async move {
+            let result =
+                exec_control(&control, Some(device.id.clone()), run_as, &program, args).await;
+            (device, result)
+        });
+    }
+    let mut failed = false;
+    while let Some(joined) = tasks.join_next().await {
+        let (device, result) = joined?;
+        println!("== {} [{}] ==", device.name, &device.id[..8]);
+        match result {
+            Ok((stdout, stderr, code)) => {
+                print!("{stdout}");
+                eprint!("{stderr}");
+                if code.unwrap_or(1) != 0 {
+                    eprintln!("[{}] remote exit code {:?}", device.name, code);
+                    failed = true;
+                }
+            }
+            Err(error) => {
+                eprintln!("[{}] {error}", device.name);
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        bail!("one or more devices failed");
+    }
     Ok(())
 }
 
@@ -468,5 +588,34 @@ pub(super) async fn run_app(
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_device, selector_matches};
+    use crate::server::DeviceInfo;
+
+    fn device(id: &str, name: &str) -> DeviceInfo {
+        DeviceInfo {
+            id: id.into(),
+            name: name.into(),
+            peer: "127.0.0.1:1".into(),
+            mode: "outbound".into(),
+        }
+    }
+
+    #[test]
+    fn id_prefix_selects_between_duplicate_names() {
+        let devices = vec![
+            device("11111111111111111111111111111111", "twin"),
+            device("22222222222222222222222222222222", "twin"),
+        ];
+        assert!(select_device(&devices, Some("twin")).is_err());
+        assert_eq!(
+            select_device(&devices, Some("11111111")).unwrap().id,
+            devices[0].id
+        );
+        assert!(selector_matches(&devices[1], "2222"));
     }
 }

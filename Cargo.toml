@@ -1,4 +1,4 @@
-﻿[workspace]
+[workspace]
 resolver = "2"
 members = [
     "crates/sidewire-protocol",
@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["SideWire contributors"]

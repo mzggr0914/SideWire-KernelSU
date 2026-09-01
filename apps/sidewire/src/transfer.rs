@@ -1,5 +1,5 @@
 use super::*;
-use crate::client::{exec_control, request_control};
+use crate::client::{exec_control, list_devices, request_control};
 use std::path::{Component, Path};
 
 fn absolute_output(path: PathBuf) -> Result<PathBuf> {
@@ -161,19 +161,18 @@ fn local_relative(remote_root: &str, remote_path: &str) -> Result<PathBuf> {
     Ok(output)
 }
 
-pub(super) async fn run_push(
+async fn push_path(
     control: &str,
     device: Option<String>,
     run_as: RunAs,
     local: PathBuf,
     remote: String,
-) -> Result<()> {
+) -> Result<String> {
     let local = tokio::fs::canonicalize(local).await?;
     let metadata = tokio::fs::metadata(&local).await?;
     if metadata.is_file() {
         let bytes = push_file(control, device, run_as, &local, remote).await?;
-        println!("pushed 1 file ({bytes} bytes)");
-        return Ok(());
+        return Ok(format!("pushed 1 file ({bytes} bytes)"));
     }
     if !metadata.is_dir() {
         bail!(
@@ -207,8 +206,59 @@ pub(super) async fn run_push(
             }
         }
     }
+    Ok(format!(
+        "pushed {files} files in {directories} directories ({bytes} bytes)"
+    ))
+}
 
-    println!("pushed {files} files in {directories} directories ({bytes} bytes)");
+pub(super) async fn run_push(
+    control: &str,
+    device: Option<String>,
+    run_as: RunAs,
+    local: PathBuf,
+    remote: String,
+) -> Result<()> {
+    println!(
+        "{}",
+        push_path(control, device, run_as, local, remote).await?
+    );
+    Ok(())
+}
+
+pub(super) async fn run_push_all(
+    control: &str,
+    run_as: RunAs,
+    local: PathBuf,
+    remote: String,
+) -> Result<()> {
+    let devices = list_devices(control).await?;
+    if devices.is_empty() {
+        bail!("no SideWire devices connected");
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for device in devices {
+        let control = control.to_owned();
+        let local = local.clone();
+        let remote = remote.clone();
+        tasks.spawn(async move {
+            let result = push_path(&control, Some(device.id.clone()), run_as, local, remote).await;
+            (device, result)
+        });
+    }
+    let mut failed = false;
+    while let Some(joined) = tasks.join_next().await {
+        let (device, result) = joined?;
+        match result {
+            Ok(summary) => println!("[{}:{}] {summary}", device.name, &device.id[..8]),
+            Err(error) => {
+                eprintln!("[{}:{}] {error}", device.name, &device.id[..8]);
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        bail!("one or more device pushes failed");
+    }
     Ok(())
 }
 

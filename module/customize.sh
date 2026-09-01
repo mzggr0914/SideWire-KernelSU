@@ -1,5 +1,5 @@
 #!/system/bin/sh
-ui_print "- SideWire 0.6.1"
+ui_print "- SideWire 0.7.0"
 ui_print "- Root/shell execution + KernelSU WebUI"
 [ "$ARCH" = "arm64" ] || abort "SideWire currently supports arm64 only"
 set_perm "$MODPATH/bin/sidewired" 0 0 0755
@@ -10,4 +10,8 @@ export KSU_MODULE=sidewire
 [ -n "$(ksud module config get mode 2>/dev/null)" ] || ksud module config set mode outbound >/dev/null 2>&1
 [ -n "$(ksud module config get port 2>/dev/null)" ] || ksud module config set port 58321 >/dev/null 2>&1
 [ -n "$(ksud module config get autostart 2>/dev/null)" ] || ksud module config set autostart 0 >/dev/null 2>&1
+if [ -z "$(ksud module config get device_id 2>/dev/null)" ]; then
+  device_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')"
+  [ -n "$device_id" ] && ksud module config set device_id "$device_id" >/dev/null 2>&1
+fi
 ui_print "- Open the module WebUI to configure the PC endpoint"

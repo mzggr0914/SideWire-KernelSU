@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use sidewire_protocol::{
-    ExecExit, ExecIdentity, ExecRequest, FileMeta, FilePullRequest, FilePushRequest, Frame,
-    FrameKind, HelloAck, ProxyStartAck, ProxyStartRequest, ProxyTokenMode, PtyOpenRequest, decode,
-    frame, read_frame, write_frame,
+    DeviceId, ExecExit, ExecIdentity, ExecRequest, FileMeta, FilePullRequest, FilePushRequest,
+    Frame, FrameKind, HelloAck, ProxyStartAck, ProxyStartRequest, ProxyTokenMode, PtyOpenRequest,
+    decode, frame, read_frame, write_frame,
 };
 #[cfg(target_os = "android")]
 use sidewire_protocol::{PtyCompleteRequest, PtyExit, PtyOpenAck, PtyResize};
@@ -42,6 +42,8 @@ struct Cli {
     #[arg(long, default_value = "sidewire-device")]
     name: String,
     #[arg(long)]
+    device_id: Option<String>,
+    #[arg(long)]
     config: Option<String>,
 }
 
@@ -56,58 +58,62 @@ struct ResolvedConfig {
     mode: Mode,
     endpoint: String,
     name: String,
+    device_id: DeviceId,
 }
 
 fn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {
+    let mut mode = cli.mode;
+    let mut host = String::new();
+    let mut port = 58321u16;
+    let mut name = cli.name.clone();
+    let mut device_id = cli.device_id.as_deref().map(DeviceId::parse).transpose()?;
     if let Some(path) = &cli.config {
         let text = fs::read_to_string(path).with_context(|| format!("read config {path}"))?;
-        let mut mode = cli.mode;
-        let mut host = String::new();
-        let mut port = 58321u16;
-        let mut name = cli.name.clone();
         for raw in text.lines() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let Some((k, v)) = line.split_once('=') else {
+            let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            let v = v.trim().trim_matches('"');
-            match k.trim() {
+            let value = value.trim().trim_matches('"');
+            match key.trim() {
                 "mode" => {
-                    mode = if v.eq_ignore_ascii_case("inbound") {
+                    mode = if value.eq_ignore_ascii_case("inbound") {
                         Mode::Inbound
                     } else {
                         Mode::Outbound
                     }
                 }
-                "host" => host = v.into(),
-                "port" => port = v.parse().unwrap_or(58321),
-                "name" => name = v.into(),
+                "host" => host = value.into(),
+                "port" => port = value.parse().unwrap_or(58321),
+                "name" => name = value.into(),
+                "device_id" if !value.is_empty() => device_id = Some(DeviceId::parse(value)?),
                 _ => {}
             }
         }
-        let endpoint = match mode {
+    }
+    let endpoint = if cli.config.is_some() {
+        match mode {
             Mode::Inbound => format!("0.0.0.0:{port}"),
             Mode::Outbound => format!(
                 "{}:{port}",
                 if host.is_empty() { "127.0.0.1" } else { &host }
             ),
-        };
-        return Ok(ResolvedConfig {
-            mode,
-            endpoint,
-            name,
-        });
-    }
-    Ok(ResolvedConfig {
-        mode: cli.mode,
-        endpoint: match cli.mode {
+        }
+    } else {
+        match mode {
             Mode::Inbound => cli.listen.clone(),
             Mode::Outbound => cli.server.clone(),
-        },
-        name: cli.name.clone(),
+        }
+    };
+    let device_id = device_id.unwrap_or_else(|| DeviceId(rand::random::<[u8; 16]>()));
+    Ok(ResolvedConfig {
+        mode,
+        endpoint,
+        name,
+        device_id,
     })
 }
 
@@ -116,20 +122,28 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let cli = Cli::parse();
     let resolved = resolve_config(&cli)?;
-    tracing::info!(mode = ?resolved.mode, name = %resolved.name, "SideWire configuration loaded");
+    tracing::info!(
+        mode = ?resolved.mode,
+        name = %resolved.name,
+        device_id = %resolved.device_id,
+        "SideWire configuration loaded"
+    );
     match resolved.mode {
-        Mode::Inbound => run_inbound(&resolved.endpoint, &resolved.name).await,
-        Mode::Outbound => run_outbound(&resolved.endpoint, &resolved.name).await,
+        Mode::Inbound => run_inbound(&resolved.endpoint, &resolved.name, resolved.device_id).await,
+        Mode::Outbound => {
+            run_outbound(&resolved.endpoint, &resolved.name, resolved.device_id).await
+        }
     }
 }
-async fn run_inbound(bind: &str, name: &str) -> Result<()> {
+
+async fn run_inbound(bind: &str, name: &str, device_id: DeviceId) -> Result<()> {
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
     let listen_port = listener.local_addr()?.port();
     let discovery_name = name.to_owned();
     tokio::spawn(async move {
-        if let Err(error) = run_discovery_responder(discovery_name, listen_port).await {
+        if let Err(error) = run_discovery_responder(discovery_name, device_id, listen_port).await {
             tracing::warn!(%error, "SideWire discovery responder stopped");
         }
     });
@@ -140,18 +154,23 @@ async fn run_inbound(bind: &str, name: &str) -> Result<()> {
         let name = name.to_owned();
         tracing::info!(%peer, "host connected");
         tokio::spawn(async move {
-            if let Err(error) = serve(stream, &name, true).await {
+            if let Err(error) = serve(stream, &name, device_id, true).await {
                 tracing::warn!(%error, "connection ended");
             }
         });
     }
 }
 
-async fn run_discovery_responder(name: String, listen_port: u16) -> Result<()> {
+async fn run_discovery_responder(
+    name: String,
+    device_id: DeviceId,
+    listen_port: u16,
+) -> Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", sidewire_protocol::DISCOVERY_PORT))
         .await
         .context("bind SideWire discovery responder")?;
     let reply = sidewire_protocol::DiscoveryReply {
+        device_id,
         name,
         port: listen_port,
         protocol_version: sidewire_protocol::VERSION,
@@ -167,14 +186,14 @@ async fn run_discovery_responder(name: String, listen_port: u16) -> Result<()> {
     }
 }
 
-async fn run_outbound(server: &str, name: &str) -> Result<()> {
+async fn run_outbound(server: &str, name: &str, device_id: DeviceId) -> Result<()> {
     let mut delay = 1u64;
     loop {
         match TcpStream::connect(server).await {
             Ok(stream) => {
                 stream.set_nodelay(true).context("enable TCP_NODELAY")?;
                 tracing::info!(%server, "connected to SideWire host");
-                if let Err(error) = serve(stream, name, false).await {
+                if let Err(error) = serve(stream, name, device_id, false).await {
                     tracing::warn!(%error, "host connection ended");
                 }
                 delay = 1;
@@ -203,7 +222,12 @@ async fn unregister_stream(routes: &StreamRoutes, stream_id: u32) {
     routes.lock().await.remove(&stream_id);
 }
 
-async fn serve(mut stream: TcpStream, name: &str, inbound: bool) -> Result<()> {
+async fn serve(
+    mut stream: TcpStream,
+    name: &str,
+    device_id: DeviceId,
+    inbound: bool,
+) -> Result<()> {
     if inbound {
         let hello_frame = read_frame(&mut stream).await?;
         if hello_frame.kind != FrameKind::Hello {
@@ -211,9 +235,10 @@ async fn serve(mut stream: TcpStream, name: &str, inbound: bool) -> Result<()> {
         }
         let hello: sidewire_protocol::Hello = decode(&hello_frame.payload)?;
         tracing::info!(peer = %hello.name, "handshake complete");
-        send_ack(&mut stream, name).await?;
+        send_ack(&mut stream, name, device_id).await?;
     } else {
         let hello = sidewire_protocol::Hello {
+            device_id: Some(device_id),
             name: name.to_owned(),
             role: sidewire_protocol::PeerRole::Device,
             protocol_version: sidewire_protocol::VERSION,
@@ -332,8 +357,9 @@ async fn serve(mut stream: TcpStream, name: &str, inbound: bool) -> Result<()> {
     }
     result
 }
-async fn send_ack(stream: &mut TcpStream, name: &str) -> Result<()> {
+async fn send_ack(stream: &mut TcpStream, name: &str, device_id: DeviceId) -> Result<()> {
     let ack = HelloAck {
+        device_id: Some(device_id),
         name: name.to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),

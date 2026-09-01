@@ -1,6 +1,6 @@
 # SideWire
 
-ADB-independent native control bridge for rooted Android devices. SideWire 0.6.1 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
+ADB-independent native control bridge for rooted Android devices. SideWire 0.7.0 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
 
 ## Components
 
@@ -30,7 +30,7 @@ This creates:
 
 ```text
 dist/sidewire.exe
-dist/SideWire-KernelSU-v0.6.1-arm64.zip
+dist/SideWire-KernelSU-v0.7.0-arm64.zip
 ```
 
 The packager verifies required module entries and rejects Windows-style `\` separators inside the ZIP so KernelSU can detect `webroot/index.html` correctly.
@@ -53,7 +53,7 @@ powershell -File .\scripts\build-linux.ps1
 powershell -File .\scripts\release-linux.ps1
 ```
 
-The Linux release is written as `dist/sidewire-v0.6.1-linux-<arch>`. To build every platform from Windows, use `powershell -File .\scripts\build-all.ps1` or `powershell -File .\scripts\release-all.ps1`. Add `-SetupLinux` on the first run.
+The Linux release is written as `dist/sidewire-v0.7.0-linux-<arch>`. To build every platform from Windows, use `powershell -File .\scripts\build-all.ps1` or `powershell -File .\scripts\release-all.ps1`. Add `-SetupLinux` on the first run.
 
 ## Desktop convenience config
 
@@ -61,12 +61,13 @@ SideWire stores optional desktop defaults in `%APPDATA%\SideWire\config.json` on
 
 ```powershell
 .\dist\sidewire.exe config set connect 192.168.0.123:58321
+.\dist\sidewire.exe config set default-device a1b2c3d4
 .\dist\sidewire.exe config set run-as root
 .\dist\sidewire.exe config show
-.\dist\sidewire.exe config unset run-as
+.\dist\sidewire.exe config unset default-device
 ```
 
-When `connect` is configured, plain `sidewire server` automatically maintains that inbound connection. When `run-as` is configured, commands that support `--as` use it when the flag is omitted. Explicit CLI flags still win.
+When `connect` is configured, plain `sidewire server` maintains that explicit inbound endpoint. `default-device` accepts a unique device name or device-ID prefix and is used whenever `-s` is omitted. `run-as` provides the default identity for commands that support `--as`. Explicit CLI flags always win.
 
 ## Connection modes
 
@@ -88,16 +89,32 @@ Set the module WebUI to `Inbound` and choose the listening port. Then point the 
 .\dist\sidewire.exe server --connect 192.168.0.123:58321
 ```
 
-The server keeps the normal outbound listener active too and automatically retries the configured inbound endpoint after a disconnect. Once connected, `devices`, `shell`, `exec`, `push`, `pull`, forward/reverse and the other CLI commands work through the same local control port (`127.0.0.1:58322`).
+The server keeps the normal outbound listener active too and automatically retries configured inbound endpoints after a disconnect. Explicit `--connect` may be repeated, and it can be combined with `--discover`.
 
-For a single inbound device on the local LAN, the daemon also answers SideWire UDP discovery:
+Inbound daemons answer SideWire UDP discovery with their persistent device ID:
 
 ```powershell
 .\dist\sidewire.exe discover
 .\dist\sidewire.exe server --discover
 ```
 
-`server --discover` rediscovers the device after disconnects/IP changes. This convenience path intentionally targets one discovered device; multi-device discovery/selection is not part of this release.
+`discover` lists every inbound SideWire device that replies during the discovery window. `server --discover` maintains an independent connector for every discovered device, tracks endpoint/IP changes by device ID, and reconnects each device independently.
+
+Every module installation gets a persistent 128-bit SideWire device ID. The host registry is keyed by that ID rather than the display name, so devices with identical names remain distinct. If the same ID appears through more than one connection path, the already-healthy session is kept and the duplicate connection is rejected.
+
+## Device selection and multi-device commands
+
+`sidewire devices` shows the short ID, display name, connection mode and peer. Commands accepting `-s` resolve a unique name or an ID prefix. If names collide, use the displayed ID prefix.
+
+```powershell
+.\dist\sidewire.exe shell -s a1b2c3d4
+.\dist\sidewire.exe doctor -s a1b2c3d4
+.\dist\sidewire.exe wait-for-device -s a1b2c3d4 --timeout 30
+.\dist\sidewire.exe exec --all getprop ro.product.model
+.\dist\sidewire.exe push --all --as root .\build /data/local/tmp/build
+```
+
+`exec --all` and `push --all` run per-device work concurrently. `--all` cannot be combined with `-s`. Without `-s`, SideWire uses `default-device` when configured, otherwise it auto-selects only when exactly one device is connected.
 
 ## Shell and Tab completion
 On Windows, the default shell keeps cooked console editing for low-latency local typing. SideWire completes against the live Android PTY context:
@@ -169,7 +186,7 @@ CARGO_TARGET_DIR=target-linux cargo test --workspace
 bash ./scripts/release-linux.sh
 ```
 
-The shared wire protocol is version 7. Protocol changes require rebuilding both the desktop CLI and Android module; mismatched protocol versions are rejected during frame decoding.
+The shared wire protocol is version 8. Protocol changes require rebuilding both the desktop CLI and Android module; mismatched protocol versions are rejected during frame decoding.
 
 ## Security
 

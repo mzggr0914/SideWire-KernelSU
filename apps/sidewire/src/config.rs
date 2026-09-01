@@ -4,6 +4,7 @@ use super::*;
 pub(super) struct AppConfig {
     pub connect: Option<String>,
     pub run_as: Option<RunAs>,
+    pub default_device: Option<String>,
 }
 
 pub(super) fn config_path() -> Result<PathBuf> {
@@ -51,11 +52,19 @@ pub(super) fn resolve_run_as(
     requested.or(config.run_as).unwrap_or(fallback)
 }
 
+pub(super) fn resolve_device(config: &AppConfig, requested: Option<String>) -> Option<String> {
+    requested.or_else(|| config.default_device.clone())
+}
+
 pub(super) fn show() -> Result<()> {
     let path = config_path()?;
     let config = load()?;
     println!("path={}", path.display());
     println!("connect={}", config.connect.as_deref().unwrap_or(""));
+    println!(
+        "default-device={}",
+        config.default_device.as_deref().unwrap_or("")
+    );
     println!(
         "run-as={}",
         match config.run_as {
@@ -71,6 +80,7 @@ pub(super) fn set(key: &str, value: &str) -> Result<()> {
     let mut config = load()?;
     match key {
         "connect" => config.connect = Some(value.trim().to_owned()),
+        "default-device" => config.default_device = Some(value.trim().to_owned()),
         "run-as" => {
             config.run_as = Some(match value.trim().to_ascii_lowercase().as_str() {
                 "root" => RunAs::Root,
@@ -78,7 +88,7 @@ pub(super) fn set(key: &str, value: &str) -> Result<()> {
                 _ => bail!("run-as must be root or shell"),
             });
         }
-        _ => bail!("unknown config key '{key}' (supported: connect, run-as)"),
+        _ => bail!("unknown config key '{key}' (supported: connect, default-device, run-as)"),
     }
     save(&config)?;
     println!("saved {}", config_path()?.display());
@@ -89,8 +99,9 @@ pub(super) fn unset(key: &str) -> Result<()> {
     let mut config = load()?;
     match key {
         "connect" => config.connect = None,
+        "default-device" => config.default_device = None,
         "run-as" => config.run_as = None,
-        _ => bail!("unknown config key '{key}' (supported: connect, run-as)"),
+        _ => bail!("unknown config key '{key}' (supported: connect, default-device, run-as)"),
     }
     save(&config)?;
     println!("saved {}", config_path()?.display());
