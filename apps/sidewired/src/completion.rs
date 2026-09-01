@@ -3,7 +3,33 @@ use anyhow::{Context, Result};
 #[cfg(target_os = "android")]
 use sidewire_protocol::{PtyCompleteRequest, PtyCompleteResult};
 #[cfg(target_os = "android")]
-use std::fs;
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+#[cfg(target_os = "android")]
+#[derive(Clone)]
+struct CachedDirEntry {
+    name: String,
+    is_dir: bool,
+}
+
+#[cfg(target_os = "android")]
+struct CachedDirectory {
+    loaded_at: Instant,
+    entries: Arc<Vec<CachedDirEntry>>,
+}
+
+#[cfg(target_os = "android")]
+static DIRECTORY_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedDirectory>>> = OnceLock::new();
+#[cfg(target_os = "android")]
+const DIRECTORY_CACHE_TTL: Duration = Duration::from_millis(750);
+#[cfg(target_os = "android")]
+const DIRECTORY_CACHE_LIMIT: usize = 64;
 
 #[cfg(any(target_os = "android", test))]
 fn completion_token_start(line: &str, cursor: usize) -> usize {
@@ -29,22 +55,76 @@ fn completion_token_start(line: &str, cursor: usize) -> usize {
 }
 
 #[cfg(any(target_os = "android", test))]
+fn shrink_common_prefix(prefix: &mut String, value: &str) {
+    while !value.starts_with(prefix.as_str()) {
+        if prefix.pop().is_none() {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
 fn common_completion_prefix(values: &[String]) -> String {
     let Some(first) = values.first() else {
         return String::new();
     };
     let mut prefix = first.clone();
     for value in &values[1..] {
-        while !value.starts_with(&prefix) {
-            if prefix.pop().is_none() {
-                break;
-            }
-        }
+        shrink_common_prefix(&mut prefix, value);
         if prefix.is_empty() {
             break;
         }
     }
     prefix
+}
+
+#[cfg(target_os = "android")]
+fn completion_entries(path: &Path) -> Result<Arc<Vec<CachedDirEntry>>> {
+    let cache = DIRECTORY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.get(path)
+            && cached.loaded_at.elapsed() <= DIRECTORY_CACHE_TTL
+        {
+            return Ok(cached.entries.clone());
+        }
+    }
+
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("read completion directory {}", path.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let is_dir = file_type.is_dir()
+            || (file_type.is_symlink()
+                && entry
+                    .metadata()
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false));
+        entries.push(CachedDirEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir,
+        });
+    }
+
+    let entries = Arc::new(entries);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= DIRECTORY_CACHE_LIMIT {
+        cache.clear();
+    }
+    cache.insert(
+        path.to_path_buf(),
+        CachedDirectory {
+            loaded_at: Instant::now(),
+            entries: entries.clone(),
+        },
+    );
+    Ok(entries)
 }
 
 #[cfg(target_os = "android")]
@@ -75,38 +155,33 @@ pub(super) fn complete_pty_path(
         cwd.join(directory_text)
     };
 
-    let mut candidates = Vec::new();
-    for entry in fs::read_dir(&search_dir)
-        .with_context(|| format!("read completion directory {}", search_dir.display()))?
-    {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(needle) {
+    let mut matches = 0usize;
+    let mut first = None;
+    let mut prefix = String::new();
+    let entries = completion_entries(&search_dir)?;
+    for entry in entries.iter() {
+        if !entry.name.starts_with(needle) {
             continue;
         }
-        let mut candidate = format!("{directory_text}{name}");
-        if entry
-            .metadata()
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false)
-        {
+        let mut candidate = format!("{directory_text}{}", entry.name);
+        if entry.is_dir {
             candidate.push('/');
         }
-        candidates.push(candidate);
-    }
-    candidates.sort();
 
-    let replacement = match candidates.len() {
-        0 => typed.to_owned(),
-        1 => candidates.remove(0),
-        _ => {
-            let prefix = common_completion_prefix(&candidates);
-            if prefix.len() > typed.len() {
-                prefix
-            } else {
-                typed.to_owned()
-            }
+        matches += 1;
+        if matches == 1 {
+            prefix.clone_from(&candidate);
+            first = Some(candidate);
+        } else {
+            shrink_common_prefix(&mut prefix, &candidate);
         }
+    }
+
+    let replacement = match matches {
+        0 => typed.to_owned(),
+        1 => first.unwrap_or_else(|| typed.to_owned()),
+        _ if prefix.len() > typed.len() => prefix,
+        _ => typed.to_owned(),
     };
 
     let mut line = request.line.clone();

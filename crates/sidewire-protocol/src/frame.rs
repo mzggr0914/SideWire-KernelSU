@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::io::IoSlice;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAGIC: [u8; 4] = *b"SIDE";
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 pub const HEADER_LEN: usize = 16;
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
@@ -87,20 +88,55 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
     postcard::from_bytes(bytes).context("deserialize protocol payload")
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -> Result<()> {
-    if frame.payload.len() > MAX_PAYLOAD {
-        bail!("payload too large: {} bytes", frame.payload.len());
+fn frame_header(kind: FrameKind, stream_id: u32, payload_len: usize) -> Result<[u8; HEADER_LEN]> {
+    if payload_len > MAX_PAYLOAD {
+        bail!("payload too large: {payload_len} bytes");
     }
     let mut header = [0u8; HEADER_LEN];
     header[0..4].copy_from_slice(&MAGIC);
     header[4..6].copy_from_slice(&VERSION.to_be_bytes());
-    header[6..8].copy_from_slice(&(frame.kind as u16).to_be_bytes());
-    header[8..12].copy_from_slice(&frame.stream_id.to_be_bytes());
-    header[12..16].copy_from_slice(&(frame.payload.len() as u32).to_be_bytes());
-    writer.write_all(&header).await?;
-    writer.write_all(&frame.payload).await?;
-    writer.flush().await?;
+    header[6..8].copy_from_slice(&(kind as u16).to_be_bytes());
+    header[8..12].copy_from_slice(&stream_id.to_be_bytes());
+    header[12..16].copy_from_slice(&(payload_len as u32).to_be_bytes());
+    Ok(header)
+}
+
+pub async fn write_raw_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    kind: FrameKind,
+    stream_id: u32,
+    payload: &[u8],
+) -> Result<()> {
+    let header = frame_header(kind, stream_id, payload.len())?;
+    let mut header_offset = 0usize;
+    let mut payload_offset = 0usize;
+
+    while header_offset < HEADER_LEN {
+        let parts = [
+            IoSlice::new(&header[header_offset..]),
+            IoSlice::new(&payload[payload_offset..]),
+        ];
+        let written = writer.write_vectored(&parts).await?;
+        if written == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+        }
+        let header_left = HEADER_LEN - header_offset;
+        if written < header_left {
+            header_offset += written;
+            continue;
+        }
+        header_offset = HEADER_LEN;
+        payload_offset += written - header_left;
+    }
+
+    if payload_offset < payload.len() {
+        writer.write_all(&payload[payload_offset..]).await?;
+    }
     Ok(())
+}
+
+pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -> Result<()> {
+    write_raw_frame(writer, frame.kind, frame.stream_id, &frame.payload).await
 }
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
     let mut header = [0u8; HEADER_LEN];
@@ -140,5 +176,39 @@ pub fn raw_frame(kind: FrameKind, stream_id: u32, payload: Vec<u8>) -> Frame {
         kind,
         stream_id,
         payload,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameKind, read_frame, write_raw_frame};
+
+    #[tokio::test]
+    async fn vectored_writer_round_trips_payload() {
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        let send = async {
+            write_raw_frame(&mut writer, FrameKind::PtyInput, 42, b"abc123")
+                .await
+                .unwrap();
+        };
+        let receive = async {
+            let frame = read_frame(&mut reader).await.unwrap();
+            assert_eq!(frame.kind, FrameKind::PtyInput);
+            assert_eq!(frame.stream_id, 42);
+            assert_eq!(frame.payload, b"abc123");
+        };
+        tokio::join!(send, receive);
+    }
+
+    #[tokio::test]
+    async fn vectored_writer_round_trips_empty_payload() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        write_raw_frame(&mut writer, FrameKind::PtyClose, 7, &[])
+            .await
+            .unwrap();
+        let frame = read_frame(&mut reader).await.unwrap();
+        assert_eq!(frame.kind, FrameKind::PtyClose);
+        assert_eq!(frame.stream_id, 7);
+        assert!(frame.payload.is_empty());
     }
 }

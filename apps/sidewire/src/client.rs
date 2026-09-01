@@ -43,31 +43,58 @@ pub(super) async fn run_exec_client(
     program: String,
     args: Vec<String>,
 ) -> Result<()> {
-    let request = ControlRequest::Exec {
+    let request = ControlRequest::ExecStream {
         device,
         program,
         args,
         cwd: None,
         run_as,
     };
-    match request_control(control, &request).await? {
-        ControlResponse::Exec {
-            stdout,
-            stderr,
-            code,
-        } => {
-            print!("{stdout}");
-            eprint!("{stderr}");
-            if code.unwrap_or(1) != 0 {
-                bail!("remote exit code {:?}", code);
-            }
-            Ok(())
-        }
+    let mut stream = TcpStream::connect(control)
+        .await
+        .with_context(|| format!("connect to SideWire server control {control}"))?;
+    stream.set_nodelay(true).context("enable TCP_NODELAY")?;
+    let mut encoded = serde_json::to_vec(&request)?;
+    encoded.push(b'\n');
+    stream.write_all(&encoded).await?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    match serde_json::from_str::<ControlResponse>(line.trim_end())? {
+        ControlResponse::Ok { .. } => {}
         ControlResponse::Error { message } => bail!(message),
-        _ => bail!("unexpected server response"),
+        _ => bail!("unexpected exec stream response"),
+    }
+
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    loop {
+        let incoming = read_frame(&mut reader).await?;
+        match incoming.kind {
+            FrameKind::ExecStdout => {
+                stdout.write_all(&incoming.payload)?;
+                stdout.flush()?;
+            }
+            FrameKind::ExecStderr => {
+                stderr.write_all(&incoming.payload)?;
+                stderr.flush()?;
+            }
+            FrameKind::ExecExit => {
+                let exit: ExecExit = decode(&incoming.payload)?;
+                if exit.code.unwrap_or(1) != 0 {
+                    bail!("remote exit code {:?}", exit.code);
+                }
+                return Ok(());
+            }
+            FrameKind::Error => bail!(
+                "remote error: {}",
+                String::from_utf8_lossy(&incoming.payload)
+            ),
+            kind => bail!("unexpected exec stream frame {kind:?}"),
+        }
     }
 }
-
 fn parse_tcp_spec(value: &str) -> Result<u16> {
     let raw = value.strip_prefix("tcp:").unwrap_or(value);
     raw.parse::<u16>()

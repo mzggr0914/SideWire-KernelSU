@@ -130,12 +130,15 @@ fn spawn_console_reader(
         use std::io::Read;
         let stdin = std::io::stdin();
         let mut input = stdin.lock();
-        let mut byte = [0u8; 1];
+        let mut buffer = [0u8; 1024];
         while !input_stop.load(Ordering::Relaxed) {
-            match input.read(&mut byte) {
+            match input.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(_) => {
-                    if input_tx.send(ConsoleEvent::Input(vec![byte[0]])).is_err() {
+                Ok(read) => {
+                    if input_tx
+                        .send(ConsoleEvent::Input(buffer[..read].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -218,35 +221,48 @@ pub(super) async fn run_pty_client(
     let mut stdout = io::stdout();
     let (mut net_read, mut net_write) = tokio::io::split(reader);
     let input_loop = async {
+        const RAW_BATCH_BYTES: usize = 4 * 1024;
+        let mut pending = None;
         loop {
-            let event = event_rx
-                .recv()
-                .await
-                .context("terminal input reader stopped")?;
-            let outgoing = match event {
-                ConsoleEvent::Input(bytes) => raw_frame(FrameKind::PtyInput, stream_id, bytes),
+            let event = match pending.take() {
+                Some(event) => event,
+                None => event_rx
+                    .recv()
+                    .await
+                    .context("terminal input reader stopped")?,
+            };
+            match event {
+                ConsoleEvent::Input(mut bytes) => {
+                    while bytes.len() < RAW_BATCH_BYTES {
+                        match event_rx.try_recv() {
+                            Ok(ConsoleEvent::Input(more)) => bytes.extend_from_slice(&more),
+                            Ok(other) => {
+                                pending = Some(other);
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    write_raw_frame(&mut net_write, FrameKind::PtyInput, stream_id, &bytes).await?;
+                }
                 ConsoleEvent::Resize { cols, rows } => {
-                    frame(FrameKind::PtyResize, stream_id, &PtyResize { cols, rows })?
+                    let resize = frame(FrameKind::PtyResize, stream_id, &PtyResize { cols, rows })?;
+                    write_frame(&mut net_write, &resize).await?;
                 }
                 ConsoleEvent::Complete { reply, .. } => {
                     let _ = reply.send(None);
-                    continue;
                 }
                 ConsoleEvent::Error(message) => {
-                    let close = raw_frame(FrameKind::PtyClose, stream_id, Vec::new());
-                    let _ = write_frame(&mut net_write, &close).await;
+                    let _ =
+                        write_raw_frame(&mut net_write, FrameKind::PtyClose, stream_id, &[]).await;
                     bail!(message);
                 }
                 ConsoleEvent::Eof => {
-                    let close = raw_frame(FrameKind::PtyClose, stream_id, Vec::new());
-                    write_frame(&mut net_write, &close).await?;
+                    write_raw_frame(&mut net_write, FrameKind::PtyClose, stream_id, &[]).await?;
                     return Ok::<(), anyhow::Error>(());
                 }
-            };
-            write_frame(&mut net_write, &outgoing).await?;
+            }
         }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
     };
 
     let output_loop = async {
@@ -627,19 +643,16 @@ async fn run_pty_line_client(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_line_reader(stop.clone(), event_tx);
     let (mut net_read, mut net_write) = tokio::io::split(reader);
-    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
         loop {
-            match read_frame(&mut net_read).await {
-                Ok(frame) => {
-                    if remote_tx.send(Ok(frame)).is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    let _ = remote_tx.send(Err(error.to_string()));
-                    break;
-                }
+            let incoming = match read_frame(&mut net_read).await {
+                Ok(frame) => Ok(frame),
+                Err(error) => Err(error.to_string()),
+            };
+            let failed = incoming.is_err();
+            if remote_tx.send(incoming).await.is_err() || failed {
+                break;
             }
         }
     });
@@ -649,7 +662,7 @@ async fn run_pty_line_client(
         tokio::select! {
             event = event_rx.recv() => match event {
                 Some(ConsoleEvent::Input(bytes)) => {
-                    write_frame(&mut net_write, &raw_frame(FrameKind::PtyInput, stream_id, bytes)).await?;
+                    write_raw_frame(&mut net_write, FrameKind::PtyInput, stream_id, &bytes).await?;
                 }
                 Some(ConsoleEvent::Resize { cols, rows }) => {
                     let resize = frame(FrameKind::PtyResize, stream_id, &PtyResize { cols, rows })?;
@@ -673,14 +686,13 @@ async fn run_pty_line_client(
                 }
                 Some(ConsoleEvent::Error(message)) => break Err(anyhow::anyhow!(message)),
                 Some(ConsoleEvent::Eof) | None => {
-                    let close = raw_frame(FrameKind::PtyClose, stream_id, Vec::new());
-                    let _ = write_frame(&mut net_write, &close).await;
+                    let _ = write_raw_frame(&mut net_write, FrameKind::PtyClose, stream_id, &[]).await;
                     break Ok(());
                 }
             },
             signal = tokio::signal::ctrl_c() => {
                 signal.context("wait for Ctrl+C")?;
-                write_frame(&mut net_write, &raw_frame(FrameKind::PtyInput, stream_id, vec![0x03])).await?;
+                write_raw_frame(&mut net_write, FrameKind::PtyInput, stream_id, &[0x03]).await?;
             }
             remote = remote_rx.recv() => match remote {
                 Some(Ok(frame)) => match frame.kind {

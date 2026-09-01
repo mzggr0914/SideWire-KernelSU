@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use sidewire_protocol::{
-    ExecExit, ExecIdentity, ExecRequest, FileMeta, FilePullRequest, FilePushRequest, FrameKind,
-    HelloAck, ProxyStartAck, ProxyStartRequest, ProxyTokenMode, PtyOpenRequest, decode, frame,
-    raw_frame, read_frame, write_frame,
+    ExecExit, ExecIdentity, ExecRequest, FileMeta, FilePullRequest, FilePushRequest, Frame,
+    FrameKind, HelloAck, ProxyStartAck, ProxyStartRequest, ProxyTokenMode, PtyOpenRequest, decode,
+    frame, read_frame, write_frame,
 };
 #[cfg(target_os = "android")]
 use sidewire_protocol::{PtyCompleteRequest, PtyExit, PtyOpenAck, PtyResize};
@@ -11,8 +11,17 @@ use sidewire_protocol::{PtyCompleteRequest, PtyExit, PtyOpenAck, PtyResize};
 use std::fs::File as StdFile;
 #[cfg(target_os = "android")]
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::{collections::HashMap, fs, process::Stdio};
+use std::{collections::HashMap, fs, process::Stdio, sync::Arc};
 mod completion;
+mod transport;
+
+use transport::MuxWriter;
+
+const FILE_BUFFER_SIZE: usize = 256 * 1024;
+const PROXY_BUFFER_SIZE: usize = 64 * 1024;
+const STREAM_ROUTE_CAPACITY: usize = 16;
+
+type StreamRoutes = Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Frame>>>>;
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -149,8 +158,25 @@ async fn run_outbound(server: &str, name: &str) -> Result<()> {
         delay = (delay * 2).min(30);
     }
 }
+
+async fn register_stream(
+    routes: &StreamRoutes,
+    stream_id: u32,
+) -> Result<tokio::sync::mpsc::Receiver<Frame>> {
+    let (sender, receiver) = tokio::sync::mpsc::channel(STREAM_ROUTE_CAPACITY);
+    let mut routes = routes.lock().await;
+    if routes.contains_key(&stream_id) {
+        bail!("stream {stream_id} is already active");
+    }
+    routes.insert(stream_id, sender);
+    Ok(receiver)
+}
+
+async fn unregister_stream(routes: &StreamRoutes, stream_id: u32) {
+    routes.lock().await.remove(&stream_id);
+}
+
 async fn serve(mut stream: TcpStream, name: &str, inbound: bool) -> Result<()> {
-    let mut proxies: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     if inbound {
         let hello_frame = read_frame(&mut stream).await?;
         if hello_frame.kind != FrameKind::Hello {
@@ -172,93 +198,112 @@ async fn serve(mut stream: TcpStream, name: &str, inbound: bool) -> Result<()> {
         }
     }
 
-    loop {
-        let request = read_frame(&mut stream).await?;
-        match request.kind {
-            FrameKind::ExecRequest => {
-                handle_exec(&mut stream, request.stream_id, &request.payload).await?
-            }
-            FrameKind::PushRequest => {
-                if let Err(error) =
-                    handle_push(&mut stream, request.stream_id, &request.payload).await
-                {
-                    write_frame(
-                        &mut stream,
-                        &raw_frame(
-                            FrameKind::Error,
-                            request.stream_id,
-                            error.to_string().into_bytes(),
-                        ),
-                    )
-                    .await?;
+    let (mut reader, writer_half) = stream.into_split();
+    let writer = MuxWriter::new(writer_half);
+    let routes: StreamRoutes = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let proxies = Arc::new(tokio::sync::Mutex::new(HashMap::<
+        String,
+        tokio::task::JoinHandle<()>,
+    >::new()));
+
+    let result: Result<()> = async {
+        loop {
+            let request = read_frame(&mut reader).await?;
+            let routed = { routes.lock().await.get(&request.stream_id).cloned() };
+            if let Some(sender) = routed {
+                let stream_id = request.stream_id;
+                if sender.send(request).await.is_err() {
+                    unregister_stream(&routes, stream_id).await;
                 }
+                continue;
             }
-            FrameKind::PullRequest => {
-                if let Err(error) =
-                    handle_pull(&mut stream, request.stream_id, &request.payload).await
-                {
-                    write_frame(
-                        &mut stream,
-                        &raw_frame(
-                            FrameKind::Error,
-                            request.stream_id,
-                            error.to_string().into_bytes(),
-                        ),
-                    )
-                    .await?;
-                }
-            }
-            FrameKind::PtyOpen => {
-                if let Err(error) =
-                    handle_pty(&mut stream, request.stream_id, &request.payload).await
-                {
-                    write_frame(
-                        &mut stream,
-                        &raw_frame(
-                            FrameKind::Error,
-                            request.stream_id,
-                            error.to_string().into_bytes(),
-                        ),
-                    )
-                    .await?;
-                }
-            }
-            FrameKind::ProxyStartRequest => {
-                let req: ProxyStartRequest = decode(&request.payload)?;
-                match start_proxy(&req).await {
-                    Ok((ack, task)) => {
-                        if let Some(old) = proxies.insert(req.id.clone(), task) {
-                            old.abort();
+
+            let stream_id = request.stream_id;
+            match request.kind {
+                FrameKind::ExecRequest => {
+                    let writer = writer.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_exec(&writer, stream_id, &request.payload).await
+                        {
+                            writer.send_error(stream_id, error).await;
                         }
-                        write_frame(
-                            &mut stream,
-                            &frame(FrameKind::ProxyStartAck, request.stream_id, &ack)?,
-                        )
+                    });
+                }
+                FrameKind::PushRequest => {
+                    let mut inbox = register_stream(&routes, stream_id).await?;
+                    let writer = writer.clone();
+                    let routes = routes.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            handle_push(&writer, stream_id, &request.payload, &mut inbox).await;
+                        unregister_stream(&routes, stream_id).await;
+                        if let Err(error) = result {
+                            writer.send_error(stream_id, error).await;
+                        }
+                    });
+                }
+                FrameKind::PullRequest => {
+                    let writer = writer.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_pull(&writer, stream_id, &request.payload).await
+                        {
+                            writer.send_error(stream_id, error).await;
+                        }
+                    });
+                }
+                FrameKind::PtyOpen => {
+                    let mut inbox = register_stream(&routes, stream_id).await?;
+                    let writer = writer.clone();
+                    let routes = routes.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            handle_pty(&writer, stream_id, &request.payload, &mut inbox).await;
+                        unregister_stream(&routes, stream_id).await;
+                        if let Err(error) = result {
+                            writer.send_error(stream_id, error).await;
+                        }
+                    });
+                }
+                FrameKind::ProxyStartRequest => {
+                    let writer = writer.clone();
+                    let proxies = proxies.clone();
+                    tokio::spawn(async move {
+                        let result: Result<()> = async {
+                            let req: ProxyStartRequest = decode(&request.payload)?;
+                            let (ack, task) = start_proxy(&req).await?;
+                            if let Some(old) = proxies.lock().await.insert(req.id.clone(), task) {
+                                old.abort();
+                            }
+                            writer
+                                .send(&frame(FrameKind::ProxyStartAck, stream_id, &ack)?)
+                                .await
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            writer.send_error(stream_id, error).await;
+                        }
+                    });
+                }
+                FrameKind::Ping => {
+                    writer
+                        .send_raw(FrameKind::Pong, stream_id, &request.payload)
                         .await?;
-                    }
-                    Err(error) => {
-                        write_frame(
-                            &mut stream,
-                            &raw_frame(
-                                FrameKind::Error,
-                                request.stream_id,
-                                error.to_string().into_bytes(),
-                            ),
-                        )
-                        .await?
-                    }
+                }
+                kind => {
+                    writer
+                        .send_error(stream_id, format!("unsupported request {kind:?}"))
+                        .await;
                 }
             }
-            FrameKind::Ping => {
-                write_frame(
-                    &mut stream,
-                    &raw_frame(FrameKind::Pong, request.stream_id, request.payload),
-                )
-                .await?
-            }
-            kind => tracing::warn!(?kind, "ignoring unsupported request"),
         }
     }
+    .await;
+
+    routes.lock().await.clear();
+    for (_, task) in proxies.lock().await.drain() {
+        task.abort();
+    }
+    result
 }
 async fn send_ack(stream: &mut TcpStream, name: &str) -> Result<()> {
     let ack = HelloAck {
@@ -323,13 +368,10 @@ fn apply_identity(command: &mut Command, identity: ExecIdentity) -> Result<()> {
     Ok(())
 }
 
-async fn handle_exec(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> Result<()> {
+async fn handle_exec(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Result<()> {
     let request: ExecRequest = decode(payload)?;
-    let mut command = Command::new("/system/bin/sh");
+    let mut command = Command::new(&request.program);
     command
-        .arg("-c")
-        .arg("exec \"$0\" \"$@\"")
-        .arg(&request.program)
         .args(&request.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -338,28 +380,54 @@ async fn handle_exec(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> 
     if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
     }
-    let output = command
-        .output()
-        .await
+
+    let mut child = command
+        .spawn()
         .with_context(|| format!("execute {}", request.program))?;
-    if !output.stdout.is_empty() {
-        write_frame(
-            stream,
-            &raw_frame(FrameKind::ExecStdout, stream_id, output.stdout),
-        )
-        .await?;
+    let mut stdout = child.stdout.take().context("exec stdout unavailable")?;
+    let mut stderr = child.stderr.take().context("exec stderr unavailable")?;
+    let mut stdout_buffer = vec![0u8; 64 * 1024];
+    let mut stderr_buffer = vec![0u8; 64 * 1024];
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut status = None;
+    let wait = child.wait();
+    tokio::pin!(wait);
+
+    while !stdout_done || !stderr_done || status.is_none() {
+        tokio::select! {
+            read = stdout.read(&mut stdout_buffer), if !stdout_done => {
+                let read = read?;
+                if read == 0 {
+                    stdout_done = true;
+                } else {
+                    writer
+                        .send_raw(FrameKind::ExecStdout, stream_id, &stdout_buffer[..read])
+                        .await?;
+                }
+            }
+            read = stderr.read(&mut stderr_buffer), if !stderr_done => {
+                let read = read?;
+                if read == 0 {
+                    stderr_done = true;
+                } else {
+                    writer
+                        .send_raw(FrameKind::ExecStderr, stream_id, &stderr_buffer[..read])
+                        .await?;
+                }
+            }
+            result = &mut wait, if status.is_none() => {
+                status = Some(result?);
+            }
+        }
     }
-    if !output.stderr.is_empty() {
-        write_frame(
-            stream,
-            &raw_frame(FrameKind::ExecStderr, stream_id, output.stderr),
-        )
-        .await?;
-    }
+
     let exit = ExecExit {
-        code: output.status.code(),
+        code: status.and_then(|status| status.code()),
     };
-    write_frame(stream, &frame(FrameKind::ExecExit, stream_id, &exit)?).await?;
+    writer
+        .send(&frame(FrameKind::ExecExit, stream_id, &exit)?)
+        .await?;
     Ok(())
 }
 
@@ -394,8 +462,43 @@ async fn file_size_for_identity(path: &str, identity: ExecIdentity) -> Result<u6
         .with_context(|| format!("parse size for {path}"))
 }
 
-async fn handle_push(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> Result<()> {
+async fn handle_push(
+    writer: &MuxWriter,
+    stream_id: u32,
+    payload: &[u8],
+    inbox: &mut tokio::sync::mpsc::Receiver<Frame>,
+) -> Result<()> {
     let request: FilePushRequest = decode(payload)?;
+    if matches!(request.identity, ExecIdentity::Root) {
+        let mut file = tokio::fs::File::create(&request.path)
+            .await
+            .with_context(|| format!("create {}", request.path))?;
+        writer
+            .send(&frame(
+                FrameKind::FileMeta,
+                stream_id,
+                &FileMeta { size: 0 },
+            )?)
+            .await?;
+        loop {
+            let incoming = inbox
+                .recv()
+                .await
+                .context("device connection closed during push")?;
+            if incoming.stream_id != stream_id {
+                bail!("unexpected stream {} during push", incoming.stream_id);
+            }
+            match incoming.kind {
+                FrameKind::FileChunk => file.write_all(&incoming.payload).await?,
+                FrameKind::FileEnd => break,
+                _ => bail!("unexpected frame {:?} during push", incoming.kind),
+            }
+        }
+        file.flush().await?;
+        writer.send_raw(FrameKind::FileEnd, stream_id, &[]).await?;
+        return Ok(());
+    }
+
     let mut command = identity_command(
         request.identity,
         "exec /system/bin/cat > \"$1\"",
@@ -410,13 +513,18 @@ async fn handle_push(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> 
         .spawn()
         .with_context(|| format!("create {}", request.path))?;
     let mut child_stdin = child.stdin.take().context("push child stdin unavailable")?;
-    write_frame(
-        stream,
-        &frame(FrameKind::FileMeta, stream_id, &FileMeta { size: 0 })?,
-    )
-    .await?;
+    writer
+        .send(&frame(
+            FrameKind::FileMeta,
+            stream_id,
+            &FileMeta { size: 0 },
+        )?)
+        .await?;
     loop {
-        let incoming = read_frame(stream).await?;
+        let incoming = inbox
+            .recv()
+            .await
+            .context("device connection closed during push")?;
         if incoming.stream_id != stream_id {
             bail!("unexpected stream {} during push", incoming.stream_id);
         }
@@ -436,16 +544,34 @@ async fn handle_push(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> 
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    write_frame(
-        stream,
-        &raw_frame(FrameKind::FileEnd, stream_id, Vec::new()),
-    )
-    .await?;
+    writer.send_raw(FrameKind::FileEnd, stream_id, &[]).await?;
     Ok(())
 }
 
-async fn handle_pull(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> Result<()> {
+async fn handle_pull(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Result<()> {
     let request: FilePullRequest = decode(payload)?;
+    if matches!(request.identity, ExecIdentity::Root) {
+        let mut file = tokio::fs::File::open(&request.path)
+            .await
+            .with_context(|| format!("open {}", request.path))?;
+        let size = file.metadata().await?.len();
+        writer
+            .send(&frame(FrameKind::FileMeta, stream_id, &FileMeta { size })?)
+            .await?;
+        let mut buffer = vec![0u8; FILE_BUFFER_SIZE];
+        loop {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            writer
+                .send_raw(FrameKind::FileChunk, stream_id, &buffer[..read])
+                .await?;
+        }
+        writer.send_raw(FrameKind::FileEnd, stream_id, &[]).await?;
+        return Ok(());
+    }
+
     let size = file_size_for_identity(&request.path, request.identity).await?;
     let mut command = identity_command(
         request.identity,
@@ -464,22 +590,18 @@ async fn handle_pull(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> 
         .stdout
         .take()
         .context("pull child stdout unavailable")?;
-    write_frame(
-        stream,
-        &frame(FrameKind::FileMeta, stream_id, &FileMeta { size })?,
-    )
-    .await?;
-    let mut buffer = vec![0u8; 64 * 1024];
+    writer
+        .send(&frame(FrameKind::FileMeta, stream_id, &FileMeta { size })?)
+        .await?;
+    let mut buffer = vec![0u8; FILE_BUFFER_SIZE];
     loop {
         let read = stdout.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
-        write_frame(
-            stream,
-            &raw_frame(FrameKind::FileChunk, stream_id, buffer[..read].to_vec()),
-        )
-        .await?;
+        writer
+            .send_raw(FrameKind::FileChunk, stream_id, &buffer[..read])
+            .await?;
     }
     drop(stdout);
     let output = child.wait_with_output().await?;
@@ -490,11 +612,7 @@ async fn handle_pull(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> 
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    write_frame(
-        stream,
-        &raw_frame(FrameKind::FileEnd, stream_id, Vec::new()),
-    )
-    .await?;
+    writer.send_raw(FrameKind::FileEnd, stream_id, &[]).await?;
     Ok(())
 }
 
@@ -661,11 +779,16 @@ fn terminate_pty_group(pid: u32) {
     }
 }
 
-async fn handle_pty(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> Result<()> {
+async fn handle_pty(
+    writer: &MuxWriter,
+    stream_id: u32,
+    payload: &[u8],
+    inbox: &mut tokio::sync::mpsc::Receiver<Frame>,
+) -> Result<()> {
     let request: PtyOpenRequest = decode(payload)?;
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (stream, stream_id, request);
+        let _ = (writer, stream_id, request, inbox);
         bail!("PTY is only supported by the Android daemon");
     }
     #[cfg(target_os = "android")]
@@ -691,14 +814,14 @@ async fn handle_pty(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> R
             .spawn()
             .with_context(|| format!("spawn PTY program {}", request.program))?;
         let pid = child.id().unwrap_or(0);
-        write_frame(
-            stream,
-            &frame(FrameKind::PtyOpenAck, stream_id, &PtyOpenAck { pid })?,
-        )
-        .await?;
+        writer
+            .send(&frame(
+                FrameKind::PtyOpenAck,
+                stream_id,
+                &PtyOpenAck { pid },
+            )?)
+            .await?;
 
-        let (mut net_read, net_write) = tokio::io::split(stream);
-        let net_write = tokio::sync::Mutex::new(net_write);
         let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
 
         let output_loop = async {
@@ -707,12 +830,9 @@ async fn handle_pty(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> R
                 match master_read.read(&mut buffer).await {
                     Ok(0) => break,
                     Ok(n) => {
-                        let mut writer = net_write.lock().await;
-                        if let Err(error) = write_frame(
-                            &mut *writer,
-                            &raw_frame(FrameKind::PtyOutput, stream_id, buffer[..n].to_vec()),
-                        )
-                        .await
+                        if let Err(error) = writer
+                            .send_raw(FrameKind::PtyOutput, stream_id, &buffer[..n])
+                            .await
                         {
                             terminate_pty_group(pid);
                             return Err(error).context("write PTY output");
@@ -733,14 +853,11 @@ async fn handle_pty(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> R
             loop {
                 tokio::select! {
                     _ = done_rx.changed() => return Ok::<(), anyhow::Error>(()),
-                    incoming = read_frame(&mut net_read) => {
-                        let incoming = match incoming {
-                            Ok(frame) => frame,
-                            Err(error) => {
-                                terminate_pty_group(pid);
-                                let _ = child.start_kill();
-                                return Err(error);
-                            }
+                    incoming = inbox.recv() => {
+                        let Some(incoming) = incoming else {
+                            terminate_pty_group(pid);
+                            let _ = child.start_kill();
+                            bail!("device connection closed while PTY {stream_id} was active");
                         };
                         if incoming.stream_id != stream_id {
                             terminate_pty_group(pid);
@@ -750,7 +867,6 @@ async fn handle_pty(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> R
                         match incoming.kind {
                             FrameKind::PtyInput => {
                                 master_write.write_all(&incoming.payload).await?;
-                                master_write.flush().await?;
                             }
                             FrameKind::PtyResize => {
                                 let size: PtyResize = decode(&incoming.payload)?;
@@ -758,13 +874,18 @@ async fn handle_pty(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> R
                             }
                             FrameKind::PtyComplete => {
                                 let request: PtyCompleteRequest = decode(&incoming.payload)?;
-                                let completion = completion::complete_pty_path(pid, &request)?;
-                                let mut writer = net_write.lock().await;
-                                write_frame(
-                                    &mut *writer,
-                                    &frame(FrameKind::PtyCompleteResult, stream_id, &completion)?,
-                                )
-                                .await?;
+                                let completion = tokio::task::spawn_blocking(move || {
+                                    completion::complete_pty_path(pid, &request)
+                                })
+                                .await
+                                .context("join PTY completion worker")??;
+                                writer
+                                    .send(&frame(
+                                        FrameKind::PtyCompleteResult,
+                                        stream_id,
+                                        &completion,
+                                    )?)
+                                    .await?;
                             }
                             FrameKind::PtyClose => {
                                 terminate_pty_group(pid);
@@ -789,8 +910,9 @@ async fn handle_pty(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> R
         let exit = PtyExit {
             code: status.code(),
         };
-        let mut writer = net_write.lock().await;
-        write_frame(&mut *writer, &frame(FrameKind::PtyExit, stream_id, &exit)?).await?;
+        writer
+            .send(&frame(FrameKind::PtyExit, stream_id, &exit)?)
+            .await?;
         Ok(())
     }
 }
@@ -860,6 +982,7 @@ async fn start_proxy(
             let Ok((mut incoming, peer)) = listener.accept().await else {
                 break;
             };
+            let _ = incoming.set_nodelay(true);
             let target = target.clone();
             let token = token.clone();
             tokio::spawn(async move {
@@ -872,13 +995,26 @@ async fn start_proxy(
                                 bail!("proxy token mismatch");
                             }
                             let mut outgoing = TcpStream::connect(&target).await?;
-                            tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await?;
+                            outgoing.set_nodelay(true)?;
+                            tokio::io::copy_bidirectional_with_sizes(
+                                &mut incoming,
+                                &mut outgoing,
+                                PROXY_BUFFER_SIZE,
+                                PROXY_BUFFER_SIZE,
+                            )
+                            .await?;
                         }
                         ProxyTokenMode::Send => {
                             let mut outgoing = TcpStream::connect(&target).await?;
+                            outgoing.set_nodelay(true)?;
                             outgoing.write_all(&token).await?;
-                            outgoing.flush().await?;
-                            tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await?;
+                            tokio::io::copy_bidirectional_with_sizes(
+                                &mut incoming,
+                                &mut outgoing,
+                                PROXY_BUFFER_SIZE,
+                                PROXY_BUFFER_SIZE,
+                            )
+                            .await?;
                         }
                     }
                     Ok(())

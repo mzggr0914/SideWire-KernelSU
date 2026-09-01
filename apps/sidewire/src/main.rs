@@ -5,7 +5,7 @@ use sidewire_protocol::{
     ExecExit, ExecIdentity, ExecRequest, FileMeta, FilePullRequest, FilePushRequest, FrameKind,
     Hello, HelloAck, ProxyStartAck, ProxyStartRequest, ProxyTokenMode, PtyCompleteRequest,
     PtyCompleteResult, PtyExit, PtyOpenAck, PtyOpenRequest, PtyResize, decode, frame, raw_frame,
-    read_frame, write_frame,
+    read_frame, write_frame, write_raw_frame,
 };
 use std::{
     collections::HashMap,
@@ -21,7 +21,7 @@ use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, RwLock},
+    sync::RwLock,
 };
 
 const DEFAULT_DEVICE_BIND: &str = "0.0.0.0:58321";
@@ -30,6 +30,7 @@ const DEFAULT_CONTROL: &str = "127.0.0.1:58322";
 mod client;
 mod pty;
 mod server;
+mod transport;
 
 use server::{ControlRequest, ControlResponse};
 

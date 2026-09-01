@@ -1,11 +1,15 @@
 use super::*;
+use crate::transport::DeviceTransport;
+
+const FILE_BUFFER_SIZE: usize = 256 * 1024;
+const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct DeviceSession {
     pub(super) peer: String,
     device_ip: IpAddr,
     local_ip: IpAddr,
-    stream: Arc<Mutex<TcpStream>>,
+    transport: DeviceTransport,
 }
 
 type DeviceMap = Arc<RwLock<HashMap<String, DeviceSession>>>;
@@ -20,6 +24,13 @@ pub(super) struct DeviceInfo {
 pub(super) enum ControlRequest {
     Devices,
     Exec {
+        device: Option<String>,
+        program: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+        run_as: RunAs,
+    },
+    ExecStream {
         device: Option<String>,
         program: String,
         args: Vec<String>,
@@ -113,13 +124,19 @@ async fn device_listener(bind: &str, devices: DeviceMap) -> Result<()> {
         match accept_device(&mut stream).await {
             Ok(name) => {
                 tracing::info!(device = %name, peer = %peer_text, "device connected");
+                let transport = DeviceTransport::new(stream);
                 let session = DeviceSession {
                     peer: peer_text,
                     device_ip,
                     local_ip,
-                    stream: Arc::new(Mutex::new(stream)),
+                    transport: transport.clone(),
                 };
-                devices.write().await.insert(name, session);
+                devices.write().await.insert(name.clone(), session.clone());
+                let devices = devices.clone();
+                tokio::spawn(async move {
+                    transport.wait_closed().await;
+                    remove_device_if_same(&devices, &name, &session).await;
+                });
             }
             Err(error) => tracing::warn!(%peer, %error, "device handshake failed"),
         }
@@ -165,6 +182,13 @@ async fn handle_control(stream: TcpStream, devices: DeviceMap) -> Result<()> {
     }
     let request: ControlRequest = serde_json::from_str(line.trim_end())?;
     match request {
+        ControlRequest::ExecStream {
+            device,
+            program,
+            args,
+            cwd,
+            run_as,
+        } => handle_control_exec_stream(reader, &devices, device, program, args, cwd, run_as).await,
         ControlRequest::Pty {
             device,
             program,
@@ -197,6 +221,47 @@ async fn handle_control(stream: TcpStream, devices: DeviceMap) -> Result<()> {
         }
     }
 }
+
+async fn handle_control_exec_stream(
+    mut reader: BufReader<TcpStream>,
+    devices: &DeviceMap,
+    device: Option<String>,
+    program: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    run_as: RunAs,
+) -> Result<()> {
+    let (_, session) = resolve_device(devices, device.as_deref()).await?;
+    let mut remote = session.transport.open_stream().await?;
+    let stream_id = remote.id();
+    let request = ExecRequest {
+        program,
+        args,
+        cwd,
+        identity: run_as.into(),
+    };
+    remote
+        .send(&frame(FrameKind::ExecRequest, stream_id, &request)?)
+        .await?;
+
+    let mut encoded = serde_json::to_vec(&ControlResponse::Ok {
+        message: "exec stream ready".into(),
+    })?;
+    encoded.push(b'\n');
+    reader.get_mut().write_all(&encoded).await?;
+
+    loop {
+        let frame = remote.recv().await?;
+        let done = matches!(frame.kind, FrameKind::ExecExit | FrameKind::Error);
+        if write_frame(reader.get_mut(), &frame).await.is_err() {
+            return Ok(());
+        }
+        if done {
+            return Ok(());
+        }
+    }
+}
+
 async fn handle_control_pty(
     mut reader: BufReader<TcpStream>,
     devices: &DeviceMap,
@@ -212,9 +277,9 @@ async fn handle_control_pty(
         term,
         echo,
     } = options;
-    let (device_name, session) = resolve_device(devices, device.as_deref()).await?;
-    let mut device_stream = session.stream.lock().await;
-    let stream_id = 0x5054_5901;
+    let (_, session) = resolve_device(devices, device.as_deref()).await?;
+    let mut device_stream = session.transport.open_stream().await?;
+    let stream_id = device_stream.id();
     let request = PtyOpenRequest {
         program,
         args,
@@ -224,12 +289,10 @@ async fn handle_control_pty(
         term,
         echo,
     };
-    write_frame(
-        &mut *device_stream,
-        &frame(FrameKind::PtyOpen, stream_id, &request)?,
-    )
-    .await?;
-    let opened = read_frame(&mut *device_stream).await?;
+    device_stream
+        .send(&frame(FrameKind::PtyOpen, stream_id, &request)?)
+        .await?;
+    let opened = device_stream.recv().await?;
     match opened.kind {
         FrameKind::PtyOpenAck => {
             let ack: PtyOpenAck = decode(&opened.payload)?;
@@ -252,72 +315,63 @@ async fn handle_control_pty(
         kind => bail!("unexpected PTY open response {kind:?}"),
     }
 
-    let forced_reset = {
-        let (mut local_read, mut local_write) = tokio::io::split(reader);
-        let (mut device_read, mut device_write) = tokio::io::split(&mut *device_stream);
-        let local_to_device = async {
-            loop {
-                match read_frame(&mut local_read).await {
-                    Ok(mut local) => match local.kind {
-                        FrameKind::PtyInput
-                        | FrameKind::PtyResize
-                        | FrameKind::PtyClose
-                        | FrameKind::PtyComplete => {
-                            local.stream_id = stream_id;
-                            write_frame(&mut device_write, &local).await?;
-                            if local.kind == FrameKind::PtyClose {
-                                return Ok::<(), anyhow::Error>(());
-                            }
+    let transport = session.transport.clone();
+    let (mut local_read, mut local_write) = tokio::io::split(reader);
+    let local_to_device = async {
+        loop {
+            match read_frame(&mut local_read).await {
+                Ok(mut local) => match local.kind {
+                    FrameKind::PtyInput
+                    | FrameKind::PtyResize
+                    | FrameKind::PtyClose
+                    | FrameKind::PtyComplete => {
+                        local.stream_id = stream_id;
+                        transport.send_frame(&local).await?;
+                        if local.kind == FrameKind::PtyClose {
+                            return Ok::<(), anyhow::Error>(());
                         }
-                        kind => bail!("unexpected local PTY frame {kind:?}"),
-                    },
-                    Err(_) => {
-                        let close = raw_frame(FrameKind::PtyClose, stream_id, Vec::new());
-                        let _ = write_frame(&mut device_write, &close).await;
-                        return Ok::<(), anyhow::Error>(());
                     }
-                }
-            }
-        };
-        let device_to_local = async {
-            let mut local_alive = true;
-            loop {
-                let mut remote = read_frame(&mut device_read).await?;
-                if remote.stream_id != stream_id {
-                    bail!("unexpected remote stream {} during PTY", remote.stream_id);
-                }
-                let done = matches!(remote.kind, FrameKind::PtyExit | FrameKind::Error);
-                remote.stream_id = stream_id;
-                if local_alive && write_frame(&mut local_write, &remote).await.is_err() {
-                    local_alive = false;
-                }
-                if done {
+                    kind => bail!("unexpected local PTY frame {kind:?}"),
+                },
+                Err(_) => {
+                    let _ = transport
+                        .send_raw(FrameKind::PtyClose, stream_id, &[])
+                        .await;
                     return Ok::<(), anyhow::Error>(());
-                }
-            }
-        };
-        tokio::pin!(local_to_device);
-        tokio::pin!(device_to_local);
-        tokio::select! {
-            remote = &mut device_to_local => { remote?; false }
-            local = &mut local_to_device => {
-                local?;
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(3),
-                    &mut device_to_local,
-                ).await {
-                    Ok(remote) => { remote?; false }
-                    Err(_) => true,
                 }
             }
         }
     };
-
-    if forced_reset {
-        let _ = device_stream.shutdown().await;
-        drop(device_stream);
-        remove_device_if_same(devices, &device_name, &session).await;
-        bail!("PTY did not terminate after client disconnect; device connection reset");
+    let device_to_local = async {
+        let mut local_alive = true;
+        loop {
+            let remote = device_stream.recv().await?;
+            if remote.stream_id != stream_id {
+                bail!("unexpected remote stream {} during PTY", remote.stream_id);
+            }
+            let done = matches!(remote.kind, FrameKind::PtyExit | FrameKind::Error);
+            if local_alive && write_frame(&mut local_write, &remote).await.is_err() {
+                local_alive = false;
+            }
+            if done {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    };
+    tokio::pin!(local_to_device);
+    tokio::pin!(device_to_local);
+    tokio::select! {
+        remote = &mut device_to_local => remote?,
+        local = &mut local_to_device => {
+            local?;
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(3),
+                &mut device_to_local,
+            ).await {
+                Ok(remote) => remote?,
+                Err(_) => bail!("PTY did not terminate after client disconnect"),
+            }
+        }
     }
     Ok(())
 }
@@ -343,18 +397,15 @@ async fn process_control(request: ControlRequest, devices: &DeviceMap) -> Contro
             cwd,
             run_as,
         } => match resolve_device(devices, device.as_deref()).await {
-            Ok((name, session)) => match remote_exec(&session, program, args, cwd, run_as).await {
+            Ok((_, session)) => match remote_exec(&session, program, args, cwd, run_as).await {
                 Ok((stdout, stderr, code)) => ControlResponse::Exec {
                     stdout,
                     stderr,
                     code,
                 },
-                Err(error) => {
-                    remove_device_if_same(devices, &name, &session).await;
-                    ControlResponse::Error {
-                        message: error.to_string(),
-                    }
-                }
+                Err(error) => ControlResponse::Error {
+                    message: error.to_string(),
+                },
             },
             Err(error) => ControlResponse::Error {
                 message: error.to_string(),
@@ -395,6 +446,9 @@ async fn process_control(request: ControlRequest, devices: &DeviceMap) -> Contro
             Err(error) => ControlResponse::Error {
                 message: error.to_string(),
             },
+        },
+        ControlRequest::ExecStream { .. } => ControlResponse::Error {
+            message: "exec stream request must use streaming control".into(),
         },
         ControlRequest::Pty { .. } => ControlResponse::Error {
             message: "PTY request must use streaming control".into(),
@@ -460,7 +514,7 @@ async fn remove_device_if_same(devices: &DeviceMap, name: &str, session: &Device
         .read()
         .await
         .get(name)
-        .map(|current| Arc::ptr_eq(&current.stream, &session.stream))
+        .map(|current| current.transport.same_connection(&session.transport))
         .unwrap_or(false);
     if should_remove {
         devices.write().await.remove(name);
@@ -474,19 +528,22 @@ async fn remote_exec(
     cwd: Option<String>,
     run_as: RunAs,
 ) -> Result<(String, String, Option<i32>)> {
-    let mut stream = session.stream.lock().await;
+    let mut stream = session.transport.open_stream().await?;
+    let stream_id = stream.id();
     let request = ExecRequest {
         program,
         args,
         cwd,
         identity: run_as.into(),
     };
-    write_frame(&mut *stream, &frame(FrameKind::ExecRequest, 1, &request)?).await?;
+    stream
+        .send(&frame(FrameKind::ExecRequest, stream_id, &request)?)
+        .await?;
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     loop {
-        let response = read_frame(&mut *stream).await?;
+        let response = stream.recv().await?;
         match response.kind {
             FrameKind::ExecStdout => stdout.extend_from_slice(&response.payload),
             FrameKind::ExecStderr => stderr.extend_from_slice(&response.payload),
@@ -516,13 +573,16 @@ async fn remote_push(
         .await
         .with_context(|| format!("open local file {local}"))?;
     let size = file.metadata().await?.len();
-    let mut stream = session.stream.lock().await;
+    let mut stream = session.transport.open_stream().await?;
+    let stream_id = stream.id();
     let request = FilePushRequest {
         path: remote,
         identity: run_as.into(),
     };
-    write_frame(&mut *stream, &frame(FrameKind::PushRequest, 2, &request)?).await?;
-    let ready = read_frame(&mut *stream).await?;
+    stream
+        .send(&frame(FrameKind::PushRequest, stream_id, &request)?)
+        .await?;
+    let ready = stream.recv().await?;
     match ready.kind {
         FrameKind::FileMeta => {
             let _: FileMeta = decode(&ready.payload)?;
@@ -533,20 +593,16 @@ async fn remote_push(
         ),
         other => bail!("unexpected push response {other:?}"),
     }
-    let mut buffer = vec![0u8; 64 * 1024];
+    let mut buffer = vec![0u8; FILE_BUFFER_SIZE];
     loop {
         let n = file.read(&mut buffer).await?;
         if n == 0 {
             break;
         }
-        write_frame(
-            &mut *stream,
-            &raw_frame(FrameKind::FileChunk, 2, buffer[..n].to_vec()),
-        )
-        .await?;
+        stream.send_raw(FrameKind::FileChunk, &buffer[..n]).await?;
     }
-    write_frame(&mut *stream, &raw_frame(FrameKind::FileEnd, 2, Vec::new())).await?;
-    let done = read_frame(&mut *stream).await?;
+    stream.send_raw(FrameKind::FileEnd, &[]).await?;
+    let done = stream.recv().await?;
     match done.kind {
         FrameKind::FileEnd => Ok(size),
         FrameKind::Error => bail!(
@@ -563,13 +619,16 @@ async fn remote_pull(
     local: &str,
     run_as: RunAs,
 ) -> Result<u64> {
-    let mut stream = session.stream.lock().await;
+    let mut stream = session.transport.open_stream().await?;
+    let stream_id = stream.id();
     let request = FilePullRequest {
         path: remote,
         identity: run_as.into(),
     };
-    write_frame(&mut *stream, &frame(FrameKind::PullRequest, 3, &request)?).await?;
-    let meta_frame = read_frame(&mut *stream).await?;
+    stream
+        .send(&frame(FrameKind::PullRequest, stream_id, &request)?)
+        .await?;
+    let meta_frame = stream.recv().await?;
     let meta = match meta_frame.kind {
         FrameKind::FileMeta => decode::<FileMeta>(&meta_frame.payload)?,
         FrameKind::Error => bail!(
@@ -589,7 +648,7 @@ async fn remote_pull(
         .with_context(|| format!("create {}", path.display()))?;
     let mut written = 0u64;
     loop {
-        let incoming = read_frame(&mut *stream).await?;
+        let incoming = stream.recv().await?;
         match incoming.kind {
             FrameKind::FileChunk => {
                 file.write_all(&incoming.payload).await?;
@@ -618,13 +677,12 @@ async fn remote_start_proxy(
     session: &DeviceSession,
     request: ProxyStartRequest,
 ) -> Result<ProxyStartAck> {
-    let mut stream = session.stream.lock().await;
-    write_frame(
-        &mut *stream,
-        &frame(FrameKind::ProxyStartRequest, 4, &request)?,
-    )
-    .await?;
-    let response = read_frame(&mut *stream).await?;
+    let mut stream = session.transport.open_stream().await?;
+    let stream_id = stream.id();
+    stream
+        .send(&frame(FrameKind::ProxyStartRequest, stream_id, &request)?)
+        .await?;
+    let response = stream.recv().await?;
     match response.kind {
         FrameKind::ProxyStartAck => Ok(decode(&response.payload)?),
         FrameKind::Error => bail!(
@@ -664,13 +722,20 @@ async fn start_forward(
             let Ok((mut local, peer)) = listener.accept().await else {
                 break;
             };
+            let _ = local.set_nodelay(true);
             let token = token.clone();
             tokio::spawn(async move {
                 let result: Result<()> = async {
                     let mut remote = TcpStream::connect((device_ip, proxy_port)).await?;
+                    remote.set_nodelay(true)?;
                     remote.write_all(&token).await?;
-                    remote.flush().await?;
-                    tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
+                    tokio::io::copy_bidirectional_with_sizes(
+                        &mut local,
+                        &mut remote,
+                        PROXY_BUFFER_SIZE,
+                        PROXY_BUFFER_SIZE,
+                    )
+                    .await?;
                     Ok(())
                 }
                 .await;
@@ -697,6 +762,7 @@ async fn start_reverse(
             let Ok((mut incoming, peer)) = relay.accept().await else {
                 break;
             };
+            let _ = incoming.set_nodelay(true);
             let token = relay_token.clone();
             tokio::spawn(async move {
                 let result: Result<()> = async {
@@ -706,7 +772,14 @@ async fn start_reverse(
                         bail!("reverse relay token mismatch");
                     }
                     let mut local = TcpStream::connect(("127.0.0.1", host_port)).await?;
-                    tokio::io::copy_bidirectional(&mut incoming, &mut local).await?;
+                    local.set_nodelay(true)?;
+                    tokio::io::copy_bidirectional_with_sizes(
+                        &mut incoming,
+                        &mut local,
+                        PROXY_BUFFER_SIZE,
+                        PROXY_BUFFER_SIZE,
+                    )
+                    .await?;
                     Ok(())
                 }
                 .await;

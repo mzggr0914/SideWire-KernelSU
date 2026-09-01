@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.6"
+version = "0.5.7"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["SideWire contributors"]
@@ -24,3 +24,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 panic = "abort"
+lto = "thin"
+codegen-units = 1

@@ -88,7 +88,7 @@ cargo test --workspace
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1
 ```
 
-The shared wire protocol is currently version 5. Protocol changes require rebuilding both `sidewire.exe` and the Android KernelSU module; mismatched protocol versions are rejected during connection setup.
+The shared wire protocol is currently version 6. Protocol changes require rebuilding both `sidewire.exe` and the Android KernelSU module; mismatched protocol versions are rejected during connection setup.
 
 ## Repository layout
 
