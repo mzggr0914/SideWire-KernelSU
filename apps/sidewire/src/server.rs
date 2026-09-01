@@ -1,6 +1,10 @@
 use super::*;
 use crate::transport::DeviceTransport;
-use sidewire_protocol::DeviceId;
+use sidewire_protocol::{
+    DeviceId, SecureFrameReader, SecureFrameWriter, SecurityBanner, SecurityClientHello,
+    SecurityDecision, SecurityMode, SharedNoise, noise_initiator, noise_responder, read_packet,
+    security_prologue, write_packet,
+};
 use std::collections::HashSet;
 
 const FILE_BUFFER_SIZE: usize = 256 * 1024;
@@ -30,6 +34,8 @@ struct DeviceSession {
     device_ip: IpAddr,
     local_ip: IpAddr,
     transport: DeviceTransport,
+    security: SecurityMode,
+    shared_secret: Option<[u8; 32]>,
 }
 
 type DeviceMap = Arc<RwLock<HashMap<DeviceId, DeviceSession>>>;
@@ -39,6 +45,7 @@ pub(super) struct DeviceInfo {
     pub(super) name: String,
     pub(super) peer: String,
     pub(super) mode: String,
+    pub(super) security: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,30 +140,41 @@ pub(super) async fn run_server(
     control: &str,
     connect: Vec<String>,
     discover: bool,
+    insecure: bool,
 ) -> Result<()> {
+    let security = if insecure {
+        SecurityMode::Insecure
+    } else {
+        SecurityMode::Secure
+    };
+    if insecure {
+        tracing::warn!(
+            "INSECURE MODE: SideWire authentication and traffic encryption are disabled"
+        );
+    }
     let devices: DeviceMap = Arc::new(RwLock::new(HashMap::new()));
-    tracing::info!(%bind, %control, inbound_targets = connect.len(), discover, "SideWire server starting");
+    tracing::info!(%bind, %control, inbound_targets = connect.len(), discover, security = security.as_str(), "SideWire server starting");
 
     for endpoint in connect {
         let devices = devices.clone();
         tokio::spawn(async move {
-            device_connector(endpoint, devices).await;
+            device_connector(endpoint, devices, security).await;
         });
     }
     if discover {
         let devices = devices.clone();
         tokio::spawn(async move {
-            discovered_device_manager(devices).await;
+            discovered_device_manager(devices, security).await;
         });
     }
 
-    let device_task = device_listener(bind, devices.clone());
+    let device_task = device_listener(bind, devices.clone(), security);
     let control_task = control_listener(control, devices);
     tokio::try_join!(device_task, control_task)?;
     Ok(())
 }
 
-async fn device_listener(bind: &str, devices: DeviceMap) -> Result<()> {
+async fn device_listener(bind: &str, devices: DeviceMap, security: SecurityMode) -> Result<()> {
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind device listener {bind}"))?;
@@ -167,9 +185,9 @@ async fn device_listener(bind: &str, devices: DeviceMap) -> Result<()> {
         let peer_text = peer.to_string();
         let device_ip = peer.ip();
         let local_ip = stream.local_addr()?.ip();
-        match accept_device(&mut stream).await {
+        match accept_device(&mut stream, security).await {
             Ok(identity) => {
-                let transport = DeviceTransport::new(stream);
+                let transport = DeviceTransport::new(stream, identity.noise.clone());
                 let session = DeviceSession {
                     id: identity.id,
                     name: identity.name,
@@ -178,6 +196,8 @@ async fn device_listener(bind: &str, devices: DeviceMap) -> Result<()> {
                     device_ip,
                     local_ip,
                     transport: transport.clone(),
+                    security: identity.security,
+                    shared_secret: identity.shared_secret,
                 };
                 if let Err(error) = register_device(&devices, session).await {
                     tracing::warn!(%peer, %error, "outbound device rejected");
@@ -191,10 +211,155 @@ async fn device_listener(bind: &str, devices: DeviceMap) -> Result<()> {
 struct DeviceIdentity {
     id: DeviceId,
     name: String,
+    security: SecurityMode,
+    noise: Option<SharedNoise>,
+    shared_secret: Option<[u8; 32]>,
 }
 
-async fn accept_device(stream: &mut TcpStream) -> Result<DeviceIdentity> {
-    let hello_frame = read_frame(stream).await?;
+async fn accept_security(
+    stream: &mut TcpStream,
+    security: SecurityMode,
+) -> Result<(DeviceId, Option<SharedNoise>, Option<[u8; 32]>)> {
+    let host_id = crate::trust::host_id()?;
+    write_packet(
+        stream,
+        &SecurityBanner {
+            node_id: host_id,
+            security,
+            protocol_version: sidewire_protocol::VERSION,
+        },
+    )
+    .await?;
+    let hello: SecurityClientHello = read_packet(stream).await?;
+    if hello.protocol_version != sidewire_protocol::VERSION {
+        let message = format!(
+            "protocol mismatch: peer {}, host {}",
+            hello.protocol_version,
+            sidewire_protocol::VERSION
+        );
+        write_packet(
+            stream,
+            &SecurityDecision {
+                accepted: false,
+                message: message.clone(),
+            },
+        )
+        .await?;
+        bail!(message);
+    }
+    if hello.security != security {
+        let message = format!(
+            "security mode mismatch: peer {}, host {}",
+            hello.security.as_str(),
+            security.as_str()
+        );
+        write_packet(
+            stream,
+            &SecurityDecision {
+                accepted: false,
+                message: message.clone(),
+            },
+        )
+        .await?;
+        bail!(message);
+    }
+    let secret = match security {
+        SecurityMode::Secure => match crate::trust::device_secret(hello.node_id)? {
+            Some(secret) => Some(secret),
+            None => {
+                let message = format!(
+                    "device {} is not paired; run sidewire pair first",
+                    hello.node_id.short()
+                );
+                write_packet(
+                    stream,
+                    &SecurityDecision {
+                        accepted: false,
+                        message: message.clone(),
+                    },
+                )
+                .await?;
+                bail!(message);
+            }
+        },
+        SecurityMode::Insecure => None,
+    };
+    write_packet(
+        stream,
+        &SecurityDecision {
+            accepted: true,
+            message: "ok".into(),
+        },
+    )
+    .await?;
+    let noise = if let Some(secret) = secret {
+        let prologue = security_prologue(hello.node_id, host_id);
+        Some(noise_responder(stream, &secret, &prologue).await?)
+    } else {
+        None
+    };
+    Ok((hello.node_id, noise, secret))
+}
+
+async fn connect_security(
+    stream: &mut TcpStream,
+    security: SecurityMode,
+) -> Result<(DeviceId, Option<SharedNoise>, Option<[u8; 32]>)> {
+    let banner: SecurityBanner = read_packet(stream).await?;
+    if banner.protocol_version != sidewire_protocol::VERSION {
+        bail!(
+            "protocol mismatch: device {}, host {}",
+            banner.protocol_version,
+            sidewire_protocol::VERSION
+        );
+    }
+    if banner.security != security {
+        bail!(
+            "security mode mismatch: device {}, host {}; both sides must explicitly use the same mode",
+            banner.security.as_str(),
+            security.as_str()
+        );
+    }
+    let host_id = crate::trust::host_id()?;
+    let secret = match security {
+        SecurityMode::Secure => Some(crate::trust::device_secret(banner.node_id)?.with_context(
+            || {
+                format!(
+                    "device {} is not paired; run sidewire pair first",
+                    banner.node_id.short()
+                )
+            },
+        )?),
+        SecurityMode::Insecure => None,
+    };
+    write_packet(
+        stream,
+        &SecurityClientHello {
+            node_id: host_id,
+            security,
+            protocol_version: sidewire_protocol::VERSION,
+        },
+    )
+    .await?;
+    let decision: SecurityDecision = read_packet(stream).await?;
+    if !decision.accepted {
+        bail!(decision.message);
+    }
+    let noise = if let Some(secret) = secret {
+        let prologue = security_prologue(host_id, banner.node_id);
+        Some(noise_initiator(stream, &secret, &prologue).await?)
+    } else {
+        None
+    };
+    Ok((banner.node_id, noise, secret))
+}
+
+async fn accept_device(stream: &mut TcpStream, security: SecurityMode) -> Result<DeviceIdentity> {
+    let (security_id, noise, shared_secret) = accept_security(stream, security).await?;
+    let hello_frame = {
+        let mut reader = SecureFrameReader::new(&mut *stream, noise.clone());
+        reader.read_frame().await?
+    };
     if hello_frame.kind != FrameKind::Hello {
         bail!("expected device Hello");
     }
@@ -202,28 +367,48 @@ async fn accept_device(stream: &mut TcpStream) -> Result<DeviceIdentity> {
     let id = hello
         .device_id
         .context("device Hello did not include device_id")?;
+    if id != security_id {
+        bail!("device identity changed after security handshake");
+    }
     let ack = HelloAck {
         device_id: None,
         name: "sidewire-server".into(),
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
     };
-    write_frame(stream, &frame(FrameKind::HelloAck, 0, &ack)?).await?;
+    {
+        let mut writer = SecureFrameWriter::new(&mut *stream, noise.clone());
+        writer
+            .write_frame(&frame(FrameKind::HelloAck, 0, &ack)?)
+            .await?;
+    }
     Ok(DeviceIdentity {
         id,
         name: hello.name,
+        security,
+        noise,
+        shared_secret,
     })
 }
 
-async fn connect_device(stream: &mut TcpStream) -> Result<DeviceIdentity> {
+async fn connect_device(stream: &mut TcpStream, security: SecurityMode) -> Result<DeviceIdentity> {
+    let (security_id, noise, shared_secret) = connect_security(stream, security).await?;
     let hello = Hello {
         device_id: None,
         name: "sidewire-server".into(),
         role: sidewire_protocol::PeerRole::Host,
         protocol_version: sidewire_protocol::VERSION,
     };
-    write_frame(stream, &frame(FrameKind::Hello, 0, &hello)?).await?;
-    let ack_frame = read_frame(stream).await?;
+    {
+        let mut writer = SecureFrameWriter::new(&mut *stream, noise.clone());
+        writer
+            .write_frame(&frame(FrameKind::Hello, 0, &hello)?)
+            .await?;
+    }
+    let ack_frame = {
+        let mut reader = SecureFrameReader::new(&mut *stream, noise.clone());
+        reader.read_frame().await?
+    };
     if ack_frame.kind != FrameKind::HelloAck {
         bail!("expected device HelloAck");
     }
@@ -231,10 +416,19 @@ async fn connect_device(stream: &mut TcpStream) -> Result<DeviceIdentity> {
     let id = ack
         .device_id
         .context("device HelloAck did not include device_id")?;
+    if id != security_id {
+        bail!("device identity changed after security handshake");
+    }
     if ack.name.trim().is_empty() {
         bail!("device returned an empty name");
     }
-    Ok(DeviceIdentity { id, name: ack.name })
+    Ok(DeviceIdentity {
+        id,
+        name: ack.name,
+        security,
+        noise,
+        shared_secret,
+    })
 }
 
 async fn register_device(devices: &DeviceMap, session: DeviceSession) -> Result<()> {
@@ -277,6 +471,7 @@ async fn connect_endpoint_once(
     endpoint: &str,
     expected_id: Option<DeviceId>,
     devices: &DeviceMap,
+    security: SecurityMode,
 ) -> Result<()> {
     tracing::info!(%endpoint, "connecting to inbound SideWire device");
     let mut stream = TcpStream::connect(endpoint)
@@ -285,7 +480,7 @@ async fn connect_endpoint_once(
     stream.set_nodelay(true).context("enable TCP_NODELAY")?;
     let peer = stream.peer_addr()?;
     let local = stream.local_addr()?;
-    let identity = connect_device(&mut stream).await?;
+    let identity = connect_device(&mut stream, security).await?;
     if let Some(expected) = expected_id
         && identity.id != expected
     {
@@ -295,7 +490,7 @@ async fn connect_endpoint_once(
             identity.id.short()
         );
     }
-    let transport = DeviceTransport::new(stream);
+    let transport = DeviceTransport::new(stream, identity.noise.clone());
     let session = DeviceSession {
         id: identity.id,
         name: identity.name,
@@ -304,16 +499,18 @@ async fn connect_endpoint_once(
         device_ip: peer.ip(),
         local_ip: local.ip(),
         transport: transport.clone(),
+        security: identity.security,
+        shared_secret: identity.shared_secret,
     };
     register_device(devices, session).await?;
     transport.wait_closed().await;
     Ok(())
 }
 
-async fn device_connector(endpoint: String, devices: DeviceMap) {
+async fn device_connector(endpoint: String, devices: DeviceMap, security: SecurityMode) {
     let mut delay = 1u64;
     loop {
-        match connect_endpoint_once(&endpoint, None, &devices).await {
+        match connect_endpoint_once(&endpoint, None, &devices, security).await {
             Ok(()) => delay = 1,
             Err(error) => tracing::warn!(%endpoint, %error, "inbound device connect failed"),
         }
@@ -326,6 +523,7 @@ async fn discovered_device_connector(
     device_id: DeviceId,
     endpoints: Arc<RwLock<HashMap<DeviceId, String>>>,
     devices: DeviceMap,
+    security: SecurityMode,
 ) {
     let mut delay = 1u64;
     loop {
@@ -344,7 +542,7 @@ async fn discovered_device_connector(
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             continue;
         };
-        match connect_endpoint_once(&endpoint, Some(device_id), &devices).await {
+        match connect_endpoint_once(&endpoint, Some(device_id), &devices, security).await {
             Ok(()) => delay = 1,
             Err(error) => {
                 tracing::debug!(device_id = %device_id.short(), %endpoint, %error, "discovered device connect failed")
@@ -355,7 +553,7 @@ async fn discovered_device_connector(
     }
 }
 
-async fn discovered_device_manager(devices: DeviceMap) {
+async fn discovered_device_manager(devices: DeviceMap, security: SecurityMode) {
     let endpoints = Arc::new(RwLock::new(HashMap::<DeviceId, String>::new()));
     let mut started = HashSet::new();
     loop {
@@ -372,6 +570,10 @@ async fn discovered_device_manager(devices: DeviceMap) {
                         );
                         continue;
                     }
+                    if device.security != security {
+                        tracing::debug!(device = %device.name, device_security = device.security.as_str(), host_security = security.as_str(), "ignoring discovered device with different security mode");
+                        continue;
+                    }
                     endpoints
                         .write()
                         .await
@@ -383,6 +585,7 @@ async fn discovered_device_manager(devices: DeviceMap) {
                             device.device_id,
                             endpoints,
                             devices,
+                            security,
                         ));
                     }
                 }
@@ -643,6 +846,7 @@ async fn process_control(request: ControlRequest, devices: &DeviceMap) -> Contro
                     name: session.name.clone(),
                     peer: session.peer.clone(),
                     mode: session.mode.as_str().to_owned(),
+                    security: session.security.as_str().to_owned(),
                 })
                 .collect();
             list.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
@@ -1040,6 +1244,7 @@ async fn start_forward(
         .context("invalid proxy bind")?
         .parse()?;
     let device_ip = session.device_ip;
+    let shared_secret = session.shared_secret;
     tokio::spawn(async move {
         loop {
             let Ok((mut local, peer)) = listener.accept().await else {
@@ -1051,14 +1256,23 @@ async fn start_forward(
                 let result: Result<()> = async {
                     let mut remote = TcpStream::connect((device_ip, proxy_port)).await?;
                     remote.set_nodelay(true)?;
-                    remote.write_all(&token).await?;
-                    tokio::io::copy_bidirectional_with_sizes(
-                        &mut local,
-                        &mut remote,
-                        PROXY_BUFFER_SIZE,
-                        PROXY_BUFFER_SIZE,
-                    )
-                    .await?;
+                    if let Some(secret) = shared_secret {
+                        let prologue = sidewire_protocol::proxy_prologue(&token, "forward");
+                        let noise =
+                            sidewire_protocol::noise_initiator(&mut remote, &secret, &prologue)
+                                .await?;
+                        sidewire_protocol::copy_noise_tunnel(&mut local, &mut remote, noise)
+                            .await?;
+                    } else {
+                        remote.write_all(&token).await?;
+                        tokio::io::copy_bidirectional_with_sizes(
+                            &mut local,
+                            &mut remote,
+                            PROXY_BUFFER_SIZE,
+                            PROXY_BUFFER_SIZE,
+                        )
+                        .await?;
+                    }
                     Ok(())
                 }
                 .await;
@@ -1080,6 +1294,7 @@ async fn start_reverse(
     let relay_port = relay.local_addr()?.port();
     let token = rand::random::<[u8; 16]>().to_vec();
     let relay_token = token.clone();
+    let shared_secret = session.shared_secret;
     tokio::spawn(async move {
         loop {
             let Ok((mut incoming, peer)) = relay.accept().await else {
@@ -1089,20 +1304,29 @@ async fn start_reverse(
             let token = relay_token.clone();
             tokio::spawn(async move {
                 let result: Result<()> = async {
-                    let mut received = vec![0u8; token.len()];
-                    incoming.read_exact(&mut received).await?;
-                    if received != token {
-                        bail!("reverse relay token mismatch");
-                    }
                     let mut local = TcpStream::connect(("127.0.0.1", host_port)).await?;
                     local.set_nodelay(true)?;
-                    tokio::io::copy_bidirectional_with_sizes(
-                        &mut incoming,
-                        &mut local,
-                        PROXY_BUFFER_SIZE,
-                        PROXY_BUFFER_SIZE,
-                    )
-                    .await?;
+                    if let Some(secret) = shared_secret {
+                        let prologue = sidewire_protocol::proxy_prologue(&token, "reverse");
+                        let noise =
+                            sidewire_protocol::noise_responder(&mut incoming, &secret, &prologue)
+                                .await?;
+                        sidewire_protocol::copy_noise_tunnel(&mut local, &mut incoming, noise)
+                            .await?;
+                    } else {
+                        let mut received = vec![0u8; token.len()];
+                        incoming.read_exact(&mut received).await?;
+                        if received != token {
+                            bail!("reverse relay token mismatch");
+                        }
+                        tokio::io::copy_bidirectional_with_sizes(
+                            &mut incoming,
+                            &mut local,
+                            PROXY_BUFFER_SIZE,
+                            PROXY_BUFFER_SIZE,
+                        )
+                        .await?;
+                    }
                     Ok(())
                 }
                 .await;

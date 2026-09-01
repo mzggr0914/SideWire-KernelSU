@@ -6,12 +6,14 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 clap.workspace = true
 crossterm = "0.29"
 rand.workspace = true
 serde.workspace = true
 serde_json = "1"
 sidewire-protocol = { path = "../../crates/sidewire-protocol" }
+spake2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

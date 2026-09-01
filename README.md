@@ -1,6 +1,6 @@
 # SideWire
 
-ADB-independent native control bridge for rooted Android devices. SideWire 0.7.0 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
+ADB-independent native control bridge for rooted Android devices. SideWire 0.8.0 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
 
 ## Components
 
@@ -30,7 +30,7 @@ This creates:
 
 ```text
 dist/sidewire.exe
-dist/SideWire-KernelSU-v0.7.0-arm64.zip
+dist/SideWire-KernelSU-v0.8.0-arm64.zip
 ```
 
 The packager verifies required module entries and rejects Windows-style `\` separators inside the ZIP so KernelSU can detect `webroot/index.html` correctly.
@@ -53,7 +53,7 @@ powershell -File .\scripts\build-linux.ps1
 powershell -File .\scripts\release-linux.ps1
 ```
 
-The Linux release is written as `dist/sidewire-v0.7.0-linux-<arch>`. To build every platform from Windows, use `powershell -File .\scripts\build-all.ps1` or `powershell -File .\scripts\release-all.ps1`. Add `-SetupLinux` on the first run.
+The Linux release is written as `dist/sidewire-v0.8.0-linux-<arch>`. To build every platform from Windows, use `powershell -File .\scripts\build-all.ps1` or `powershell -File .\scripts\release-all.ps1`. Add `-SetupLinux` on the first run.
 
 ## Desktop convenience config
 
@@ -68,6 +68,37 @@ SideWire stores optional desktop defaults in `%APPDATA%\SideWire\config.json` on
 ```
 
 When `connect` is configured, plain `sidewire server` maintains that explicit inbound endpoint. `default-device` accepts a unique device name or device-ID prefix and is used whenever `-s` is omitted. `run-as` provides the default identity for commands that support `--as`. Explicit CLI flags always win.
+
+## Security and pairing
+
+SideWire 0.8.0 uses authenticated, encrypted connections by default. Pair each PC once from the Android WebUI: start SideWire, press **Generate pairing PIN**, then enter the six-digit PIN on the PC.
+
+```powershell
+.\dist\sidewire.exe pair 192.168.0.123
+# In inbound mode, when exactly one compatible device is discoverable:
+.\dist\sidewire.exe pair --discover
+.\dist\sidewire.exe paired
+```
+
+The PIN is valid for 60 seconds and is only used for SPAKE2 pairing. A successful pairing exchanges a random 256-bit long-term secret; later connections authenticate and encrypt automatically without asking for the PIN again. The desktop stores its host identity and paired-device secrets in `trust.json` next to the normal SideWire config. Android stores paired-host secrets under the module's private `config/paired_hosts` directory.
+
+Normal SideWire frames use a Noise PSK session (`25519` + `ChaChaPoly` + `BLAKE2s`) after authentication. Exec, PTY, file transfer, and secure forward/reverse proxy traffic are protected. UDP discovery is only locator metadata and is not itself trusted; the following TCP security handshake authenticates a paired peer.
+
+To revoke trust, remove the PC from the Android WebUI. The desktop can remove its local device trust with:
+
+```powershell
+.\dist\sidewire.exe unpair <device-name-or-id-prefix>
+```
+
+### Insecure mode
+
+For an intentionally trusted local network, authentication and encryption can be disabled. On Android, select **Insecure** in the WebUI; SideWire shows a warning dialog and does not save the change until you explicitly confirm it. Restart the daemon after changing security mode. On the PC, insecure mode must also be selected explicitly:
+
+```powershell
+.\dist\sidewire.exe server --insecure
+```
+
+Both ends must choose the same mode. A secure endpoint never falls back automatically to plaintext, so a secure/insecure mismatch is rejected. Insecure mode permits unauthenticated plaintext control and should only be used on a network you fully trust.
 
 ## Connection modes
 
@@ -104,7 +135,7 @@ Every module installation gets a persistent 128-bit SideWire device ID. The host
 
 ## Device selection and multi-device commands
 
-`sidewire devices` shows the short ID, display name, connection mode and peer. Commands accepting `-s` resolve a unique name or an ID prefix. If names collide, use the displayed ID prefix.
+`sidewire devices` shows the short ID, display name, connection mode, security mode and peer. Commands accepting `-s` resolve a unique name or an ID prefix. If names collide, use the displayed ID prefix.
 
 ```powershell
 .\dist\sidewire.exe shell -s a1b2c3d4
@@ -186,8 +217,8 @@ CARGO_TARGET_DIR=target-linux cargo test --workspace
 bash ./scripts/release-linux.sh
 ```
 
-The shared wire protocol is version 8. Protocol changes require rebuilding both the desktop CLI and Android module; mismatched protocol versions are rejected during frame decoding.
+The shared wire protocol is version 9. Protocol changes require rebuilding both the desktop CLI and Android module; mismatched protocol versions are rejected during frame decoding.
 
-## Security
+## Security notes
 
-SideWire currently does not provide transport authentication or encryption. The Android daemon can execute privileged operations, so do not expose either connection mode to untrusted networks. Keep SideWire on a trusted LAN/VPN or bind/listen more narrowly until authentication is implemented.
+Secure mode is the default and requires a successful pairing before privileged SideWire traffic is accepted. Pairing PINs are short-lived and are not retained as connection passwords. Insecure mode deliberately disables these protections and is intended only for trusted development networks. As with any root-capable remote-control service, keep SideWire's TCP ports behind a trusted LAN/VPN and avoid exposing them directly to the public Internet.

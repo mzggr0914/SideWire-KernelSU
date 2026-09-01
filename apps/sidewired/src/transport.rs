@@ -1,23 +1,23 @@
 use anyhow::Result;
-use sidewire_protocol::{Frame, FrameKind, write_frame, write_raw_frame};
+use sidewire_protocol::{Frame, FrameKind, SecureFrameWriter, SharedNoise};
 use std::sync::Arc;
 use tokio::{net::tcp::OwnedWriteHalf, sync::Mutex};
 
 #[derive(Clone)]
 pub(super) struct MuxWriter {
-    inner: Arc<Mutex<OwnedWriteHalf>>,
+    inner: Arc<Mutex<SecureFrameWriter<OwnedWriteHalf>>>,
 }
 
 impl MuxWriter {
-    pub(super) fn new(writer: OwnedWriteHalf) -> Self {
+    pub(super) fn new(writer: OwnedWriteHalf, noise: Option<SharedNoise>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(writer)),
+            inner: Arc::new(Mutex::new(SecureFrameWriter::new(writer, noise))),
         }
     }
 
     pub(super) async fn send(&self, frame: &Frame) -> Result<()> {
         let mut writer = self.inner.lock().await;
-        write_frame(&mut *writer, frame).await
+        writer.write_frame(frame).await
     }
 
     pub(super) async fn send_raw(
@@ -27,7 +27,7 @@ impl MuxWriter {
         payload: &[u8],
     ) -> Result<()> {
         let mut writer = self.inner.lock().await;
-        write_raw_frame(&mut *writer, kind, stream_id, payload).await
+        writer.write_raw(kind, stream_id, payload).await
     }
     pub(super) async fn send_error(&self, stream_id: u32, error: impl std::fmt::Display) {
         let message = error.to_string();

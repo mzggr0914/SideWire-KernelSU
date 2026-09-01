@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const DISCOVERY_PORT: u16 = 58320;
-pub const DISCOVERY_REQUEST: &[u8] = b"SIDEWIRE_DISCOVER_V2";
+pub const DISCOVERY_REQUEST: &[u8] = b"SIDEWIRE_DISCOVER_V3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeviceId(pub [u8; 16]);
@@ -48,6 +48,7 @@ pub struct DiscoveryReply {
     pub name: String,
     pub port: u16,
     pub protocol_version: u16,
+    pub security: crate::SecurityMode,
 }
 
 #[cfg(test)]

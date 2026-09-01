@@ -4,7 +4,7 @@ use std::io::IoSlice;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAGIC: [u8; 4] = *b"SIDE";
-pub const VERSION: u16 = 8;
+pub const VERSION: u16 = 9;
 pub const HEADER_LEN: usize = 16;
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
@@ -99,6 +99,42 @@ fn frame_header(kind: FrameKind, stream_id: u32, payload_len: usize) -> Result<[
     header[8..12].copy_from_slice(&stream_id.to_be_bytes());
     header[12..16].copy_from_slice(&(payload_len as u32).to_be_bytes());
     Ok(header)
+}
+
+pub fn encode_frame_bytes(frame: &Frame) -> Result<Vec<u8>> {
+    let header = frame_header(frame.kind, frame.stream_id, frame.payload.len())?;
+    let mut bytes = Vec::with_capacity(HEADER_LEN + frame.payload.len());
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&frame.payload);
+    Ok(bytes)
+}
+
+pub fn decode_frame_bytes(bytes: &[u8]) -> Result<Frame> {
+    if bytes.len() < HEADER_LEN {
+        bail!("truncated SideWire frame");
+    }
+    let header = &bytes[..HEADER_LEN];
+    if header[0..4] != MAGIC {
+        bail!("invalid SideWire frame magic");
+    }
+    let version = u16::from_be_bytes([header[4], header[5]]);
+    if version != VERSION {
+        bail!("unsupported protocol version {version}");
+    }
+    let kind = FrameKind::try_from(u16::from_be_bytes([header[6], header[7]]))?;
+    let stream_id = u32::from_be_bytes(header[8..12].try_into().unwrap());
+    let payload_len = u32::from_be_bytes(header[12..16].try_into().unwrap()) as usize;
+    if payload_len > MAX_PAYLOAD {
+        bail!("payload too large: {payload_len} bytes");
+    }
+    if bytes.len() != HEADER_LEN + payload_len {
+        bail!("invalid SideWire frame length");
+    }
+    Ok(Frame {
+        kind,
+        stream_id,
+        payload: bytes[HEADER_LEN..].to_vec(),
+    })
 }
 
 pub async fn write_raw_frame<W: AsyncWrite + Unpin>(

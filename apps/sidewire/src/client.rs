@@ -74,17 +74,18 @@ pub(super) async fn run_devices(control: &str, config: &crate::config::AppConfig
             .filter(|device| selector_matches(device, selector))
             .count()
     });
-    println!("DEFAULT\tID\tNAME\tMODE\tPEER");
+    println!("DEFAULT\tID\tNAME\tMODE\tSECURITY\tPEER");
     for device in devices {
         let is_default = config.default_device.as_deref().is_some_and(|selector| {
             default_matches == Some(1) && selector_matches(&device, selector)
         });
         println!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             if is_default { "*" } else { "" },
             &device.id[..8],
             device.name,
             device.mode,
+            device.security,
             device.peer
         );
     }
@@ -145,6 +146,7 @@ pub(super) async fn run_doctor(
     let exact = device.id.clone();
     println!("Device\t{} [{}]", device.name, &device.id[..8]);
     println!("Mode\t{}", device.mode);
+    println!("Security\t{}", device.security);
     println!("Peer\t{}", device.peer);
 
     match request_control(
@@ -602,6 +604,7 @@ mod tests {
             name: name.into(),
             peer: "127.0.0.1:1".into(),
             mode: "outbound".into(),
+            security: "secure".into(),
         }
     }
 

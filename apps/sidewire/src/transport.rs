@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use sidewire_protocol::{Frame, FrameKind, read_frame, write_frame, write_raw_frame};
+use sidewire_protocol::{Frame, FrameKind, SecureFrameReader, SecureFrameWriter, SharedNoise};
 use std::{
     collections::HashMap,
     sync::{
@@ -8,7 +8,6 @@ use std::{
     },
 };
 use tokio::{
-    io::AsyncWriteExt,
     net::{TcpStream, tcp::OwnedWriteHalf},
     sync::{Mutex, Notify, mpsc},
 };
@@ -21,7 +20,7 @@ pub(super) struct DeviceTransport {
 }
 
 struct TransportInner {
-    writer: Mutex<OwnedWriteHalf>,
+    writer: Mutex<SecureFrameWriter<OwnedWriteHalf>>,
     routes: Mutex<HashMap<u32, mpsc::Sender<Frame>>>,
     next_stream_id: AtomicU32,
     closed: AtomicBool,
@@ -34,8 +33,10 @@ pub(super) struct DeviceStream {
 }
 
 impl DeviceTransport {
-    pub(super) fn new(stream: TcpStream) -> Self {
-        let (mut reader, writer) = stream.into_split();
+    pub(super) fn new(stream: TcpStream, noise: Option<SharedNoise>) -> Self {
+        let (reader, writer) = stream.into_split();
+        let mut reader = SecureFrameReader::new(reader, noise.clone());
+        let writer = SecureFrameWriter::new(writer, noise);
         let inner = Arc::new(TransportInner {
             writer: Mutex::new(writer),
             routes: Mutex::new(HashMap::new()),
@@ -49,7 +50,7 @@ impl DeviceTransport {
 
         tokio::spawn(async move {
             loop {
-                let frame = match read_frame(&mut reader).await {
+                let frame = match reader.read_frame().await {
                     Ok(frame) => frame,
                     Err(error) => {
                         tracing::debug!(%error, "device transport reader ended");
@@ -100,7 +101,7 @@ impl DeviceTransport {
             bail!("device connection is closed");
         }
         let mut writer = self.inner.writer.lock().await;
-        write_frame(&mut *writer, frame).await
+        writer.write_frame(frame).await
     }
 
     pub(super) async fn send_raw(
@@ -113,7 +114,7 @@ impl DeviceTransport {
             bail!("device connection is closed");
         }
         let mut writer = self.inner.writer.lock().await;
-        write_raw_frame(&mut *writer, kind, stream_id, payload).await
+        writer.write_raw(kind, stream_id, payload).await
     }
     pub(super) async fn open_stream(&self) -> Result<DeviceStream> {
         if self.inner.closed.load(Ordering::Acquire) {
@@ -168,7 +169,7 @@ impl DeviceStream {
             );
         }
         let mut writer = self.transport.inner.writer.lock().await;
-        write_frame(&mut *writer, frame).await
+        writer.write_frame(frame).await
     }
 
     pub(super) async fn send_raw(&self, kind: FrameKind, payload: &[u8]) -> Result<()> {
@@ -176,7 +177,7 @@ impl DeviceStream {
             bail!("device connection is closed");
         }
         let mut writer = self.transport.inner.writer.lock().await;
-        write_raw_frame(&mut *writer, kind, self.id, payload).await
+        writer.write_raw(kind, self.id, payload).await
     }
 
     pub(super) async fn recv(&mut self) -> Result<Frame> {

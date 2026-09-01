@@ -4,6 +4,8 @@ DAEMON="$MODDIR/bin/sidewired"
 CONFIG="$MODDIR/config/sidewire.conf"
 PIDFILE="$MODDIR/sidewired.pid"
 LOGFILE="$MODDIR/sidewired.log"
+PAIRING_FILE="$MODDIR/config/pairing"
+PAIRS_DIR="$MODDIR/config/paired_hosts"
 export KSU_MODULE=sidewire
 
 get(){ ksud module config get "$1" 2>/dev/null; }
@@ -14,14 +16,46 @@ write_config(){
   host="$(get host)"; [ -n "$host" ] || host=127.0.0.1
   port="$(get port)"; [ -n "$port" ] || port=58321
   name="$(get name)"; [ -n "$name" ] || name="$(getprop ro.product.model)"
+  security="$(get security)"; [ -n "$security" ] || security=secure
+  pairing_port="$(get pairing_port)"; [ -n "$pairing_port" ] || pairing_port=58323
   device_id="$(get device_id)"
   if [ -z "$device_id" ]; then
     device_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')"
     [ -n "$device_id" ] || device_id="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
     setv device_id "$device_id"
   fi
-  { echo "mode=$mode"; echo "host=$host"; echo "port=$port"; echo "name=$name"; echo "device_id=$device_id"; } > "$CONFIG"
+  mkdir -p "$PAIRS_DIR"
+  { echo "mode=$mode"; echo "host=$host"; echo "port=$port"; echo "name=$name"; echo "device_id=$device_id"; echo "security=$security"; echo "pairing_port=$pairing_port"; echo "pairing_file=$PAIRING_FILE"; echo "pairs_dir=$PAIRS_DIR"; } > "$CONFIG"
   chmod 0600 "$CONFIG"
+}
+pair(){
+  mkdir -p "$MODDIR/config" "$PAIRS_DIR"
+  raw="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')"
+  [ -n "$raw" ] || raw="$(date +%s)"
+  pin="$(printf '%06d' $((raw % 1000000)))"
+  now="$(date +%s)"
+  { echo "pin=$pin"; echo "until=$((now + 60))"; } > "$PAIRING_FILE"
+  chmod 0600 "$PAIRING_FILE"
+  echo "$pin"
+}
+paired(){
+  mkdir -p "$PAIRS_DIR"
+  found=0
+  for file in "$PAIRS_DIR"/*.pair; do
+    [ -f "$file" ] || continue
+    found=1
+    id="${file##*/}"; id="${id%.pair}"
+    name="$(sed -n 's/^name=//p' "$file" | head -n 1)"
+    echo "$id|$name"
+  done
+  [ "$found" -eq 1 ] || true
+}
+unpair(){
+  id="$1"
+  case "$id" in *[!0-9a-fA-F]*|'') echo "invalid host id" >&2; exit 2;; esac
+  file="$PAIRS_DIR/$id.pair"
+  [ -f "$file" ] || { echo "paired host not found" >&2; exit 1; }
+  rm -f "$file"
 }
 start_daemon(){
   [ -x "$DAEMON" ] || exit 1
@@ -51,6 +85,9 @@ case "$1" in
   restart) stop_daemon; sleep 1; start_daemon;;
   status) status;;
   config) write_config; cat "$CONFIG";;
+  pair) pair;;
+  paired) paired;;
+  unpair) unpair "$2";;
   log) tail -n 120 "$LOGFILE" 2>/dev/null;;
-  *) echo "usage: sidewirectl get|set|start|stop|restart|status|config|log"; exit 2;;
+  *) echo "usage: sidewirectl get|set|start|stop|restart|status|config|pair|paired|unpair|log"; exit 2;;
 esac

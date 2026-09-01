@@ -31,10 +31,12 @@ const DEFAULT_CONTROL: &str = "127.0.0.1:58322";
 mod client;
 mod config;
 mod discovery;
+mod pairing;
 mod pty;
 mod server;
 mod transfer;
 mod transport;
+mod trust;
 
 use server::{ControlRequest, ControlResponse};
 
@@ -73,6 +75,19 @@ enum Command {
         /// Discover one inbound SideWire device on the local network.
         #[arg(long)]
         discover: bool,
+        /// Disable authentication and encryption. Both sides must explicitly use insecure mode.
+        #[arg(long)]
+        insecure: bool,
+    },
+    Pair {
+        /// Android IP or pairing endpoint. Omit with --discover.
+        target: Option<String>,
+        #[arg(long)]
+        discover: bool,
+    },
+    Paired,
+    Unpair {
+        device: String,
     },
     Discover {
         #[arg(long, default_value_t = 1500)]
@@ -258,14 +273,18 @@ async fn main() -> Result<()> {
             control,
             mut connect,
             discover,
+            insecure,
         } => {
             if connect.is_empty()
                 && let Some(endpoint) = app_config.connect.clone()
             {
                 connect.push(endpoint);
             }
-            server::run_server(&bind, &control, connect, discover).await
+            server::run_server(&bind, &control, connect, discover, insecure).await
         }
+        Command::Pair { target, discover } => pairing::run_pair(target, discover).await,
+        Command::Paired => pairing::run_paired(),
+        Command::Unpair { device } => pairing::run_unpair(device),
         Command::Discover { timeout_ms } => discovery::run_discover(timeout_ms).await,
         Command::Doctor { control, device } => {
             client::run_doctor(

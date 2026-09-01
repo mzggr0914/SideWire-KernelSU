@@ -1,5 +1,7 @@
 use super::*;
-use sidewire_protocol::{DISCOVERY_PORT, DISCOVERY_REQUEST, DeviceId, DiscoveryReply};
+use sidewire_protocol::{
+    DISCOVERY_PORT, DISCOVERY_REQUEST, DeviceId, DiscoveryReply, SecurityMode,
+};
 use std::collections::HashMap;
 use tokio::{net::UdpSocket, time::Duration};
 
@@ -9,6 +11,7 @@ pub(super) struct DiscoveredDevice {
     pub name: String,
     pub endpoint: String,
     pub protocol_version: u16,
+    pub security: SecurityMode,
 }
 
 pub(super) async fn discover_all(timeout: Duration) -> Result<Vec<DiscoveredDevice>> {
@@ -51,6 +54,7 @@ pub(super) async fn discover_all(timeout: Duration) -> Result<Vec<DiscoveredDevi
                 name: reply.name,
                 endpoint: format!("{}:{}", peer.ip(), reply.port),
                 protocol_version: reply.protocol_version,
+                security: reply.security,
             },
         );
     }
@@ -68,15 +72,16 @@ pub(super) async fn run_discover(timeout_ms: u64) -> Result<()> {
     if devices.is_empty() {
         bail!("no inbound SideWire devices discovered");
     }
-    println!("ID\tNAME\tENDPOINT\tPROTOCOL\tSTATUS");
+    println!("ID\tNAME\tENDPOINT\tPROTOCOL\tSECURITY\tSTATUS");
     for device in devices {
         let compatible = device.protocol_version == sidewire_protocol::VERSION;
         println!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             device.device_id.short(),
             device.name,
             device.endpoint,
             device.protocol_version,
+            device.security.as_str(),
             if compatible { "ready" } else { "mismatch" }
         );
     }

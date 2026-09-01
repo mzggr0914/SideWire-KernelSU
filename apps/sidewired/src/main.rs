@@ -3,7 +3,7 @@ use clap::{Parser, ValueEnum};
 use sidewire_protocol::{
     DeviceId, ExecExit, ExecIdentity, ExecRequest, FileMeta, FilePullRequest, FilePushRequest,
     Frame, FrameKind, HelloAck, ProxyStartAck, ProxyStartRequest, ProxyTokenMode, PtyOpenRequest,
-    decode, frame, read_frame, write_frame,
+    SecureFrameReader, SecureFrameWriter, SecurityMode, decode, frame,
 };
 #[cfg(target_os = "android")]
 use sidewire_protocol::{PtyCompleteRequest, PtyExit, PtyOpenAck, PtyResize};
@@ -13,6 +13,7 @@ use std::fs::File as StdFile;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::{collections::HashMap, fs, process::Stdio, sync::Arc};
 mod completion;
+mod security;
 mod transport;
 
 use transport::MuxWriter;
@@ -43,6 +44,9 @@ struct Cli {
     name: String,
     #[arg(long)]
     device_id: Option<String>,
+    /// Disable authentication and encryption for direct development runs.
+    #[arg(long)]
+    insecure: bool,
     #[arg(long)]
     config: Option<String>,
 }
@@ -59,6 +63,10 @@ struct ResolvedConfig {
     endpoint: String,
     name: String,
     device_id: DeviceId,
+    security: SecurityMode,
+    pairing_file: Option<String>,
+    pairs_dir: Option<String>,
+    pairing_port: u16,
 }
 
 fn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {
@@ -67,6 +75,14 @@ fn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {
     let mut port = 58321u16;
     let mut name = cli.name.clone();
     let mut device_id = cli.device_id.as_deref().map(DeviceId::parse).transpose()?;
+    let mut security = if cli.insecure {
+        SecurityMode::Insecure
+    } else {
+        SecurityMode::Secure
+    };
+    let mut pairing_file = None;
+    let mut pairs_dir = None;
+    let mut pairing_port = sidewire_protocol::PAIRING_PORT;
     if let Some(path) = &cli.config {
         let text = fs::read_to_string(path).with_context(|| format!("read config {path}"))?;
         for raw in text.lines() {
@@ -90,6 +106,18 @@ fn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {
                 "port" => port = value.parse().unwrap_or(58321),
                 "name" => name = value.into(),
                 "device_id" if !value.is_empty() => device_id = Some(DeviceId::parse(value)?),
+                "security" => {
+                    security = if value.eq_ignore_ascii_case("insecure") {
+                        SecurityMode::Insecure
+                    } else {
+                        SecurityMode::Secure
+                    }
+                }
+                "pairing_file" if !value.is_empty() => pairing_file = Some(value.into()),
+                "pairs_dir" if !value.is_empty() => pairs_dir = Some(value.into()),
+                "pairing_port" => {
+                    pairing_port = value.parse().unwrap_or(sidewire_protocol::PAIRING_PORT)
+                }
                 _ => {}
             }
         }
@@ -114,6 +142,10 @@ fn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {
         endpoint,
         name,
         device_id,
+        security,
+        pairing_file,
+        pairs_dir,
+        pairing_port,
     })
 }
 
@@ -122,28 +154,78 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let cli = Cli::parse();
     let resolved = resolve_config(&cli)?;
+    if resolved.security == SecurityMode::Insecure {
+        tracing::warn!(
+            "INSECURE MODE: SideWire authentication and traffic encryption are disabled"
+        );
+    }
     tracing::info!(
         mode = ?resolved.mode,
         name = %resolved.name,
         device_id = %resolved.device_id,
+        security = resolved.security.as_str(),
         "SideWire configuration loaded"
     );
+    if let (Some(pairing_file), Some(pairs_dir)) =
+        (resolved.pairing_file.clone(), resolved.pairs_dir.clone())
+    {
+        let name = resolved.name.clone();
+        let device_id = resolved.device_id;
+        let pairing_port = resolved.pairing_port;
+        tokio::spawn(async move {
+            if let Err(error) = security::run_pairing_listener(
+                pairing_port,
+                name,
+                device_id,
+                pairing_file,
+                pairs_dir,
+            )
+            .await
+            {
+                tracing::warn!(%error, "SideWire pairing listener stopped");
+            }
+        });
+    }
     match resolved.mode {
-        Mode::Inbound => run_inbound(&resolved.endpoint, &resolved.name, resolved.device_id).await,
+        Mode::Inbound => {
+            run_inbound(
+                &resolved.endpoint,
+                &resolved.name,
+                resolved.device_id,
+                resolved.security,
+                resolved.pairs_dir.clone(),
+            )
+            .await
+        }
         Mode::Outbound => {
-            run_outbound(&resolved.endpoint, &resolved.name, resolved.device_id).await
+            run_outbound(
+                &resolved.endpoint,
+                &resolved.name,
+                resolved.device_id,
+                resolved.security,
+                resolved.pairs_dir.clone(),
+            )
+            .await
         }
     }
 }
 
-async fn run_inbound(bind: &str, name: &str, device_id: DeviceId) -> Result<()> {
+async fn run_inbound(
+    bind: &str,
+    name: &str,
+    device_id: DeviceId,
+    security: SecurityMode,
+    pairs_dir: Option<String>,
+) -> Result<()> {
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
     let listen_port = listener.local_addr()?.port();
     let discovery_name = name.to_owned();
     tokio::spawn(async move {
-        if let Err(error) = run_discovery_responder(discovery_name, device_id, listen_port).await {
+        if let Err(error) =
+            run_discovery_responder(discovery_name, device_id, listen_port, security).await
+        {
             tracing::warn!(%error, "SideWire discovery responder stopped");
         }
     });
@@ -152,9 +234,10 @@ async fn run_inbound(bind: &str, name: &str, device_id: DeviceId) -> Result<()> 
         let (stream, peer) = listener.accept().await?;
         stream.set_nodelay(true).context("enable TCP_NODELAY")?;
         let name = name.to_owned();
+        let pairs_dir = pairs_dir.clone();
         tracing::info!(%peer, "host connected");
         tokio::spawn(async move {
-            if let Err(error) = serve(stream, &name, device_id, true).await {
+            if let Err(error) = serve(stream, &name, device_id, true, security, pairs_dir).await {
                 tracing::warn!(%error, "connection ended");
             }
         });
@@ -165,6 +248,7 @@ async fn run_discovery_responder(
     name: String,
     device_id: DeviceId,
     listen_port: u16,
+    security: SecurityMode,
 ) -> Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", sidewire_protocol::DISCOVERY_PORT))
         .await
@@ -174,6 +258,7 @@ async fn run_discovery_responder(
         name,
         port: listen_port,
         protocol_version: sidewire_protocol::VERSION,
+        security,
     };
     let encoded = sidewire_protocol::encode(&reply)?;
     let mut buffer = [0u8; 256];
@@ -186,14 +271,22 @@ async fn run_discovery_responder(
     }
 }
 
-async fn run_outbound(server: &str, name: &str, device_id: DeviceId) -> Result<()> {
+async fn run_outbound(
+    server: &str,
+    name: &str,
+    device_id: DeviceId,
+    security: SecurityMode,
+    pairs_dir: Option<String>,
+) -> Result<()> {
     let mut delay = 1u64;
     loop {
         match TcpStream::connect(server).await {
             Ok(stream) => {
                 stream.set_nodelay(true).context("enable TCP_NODELAY")?;
                 tracing::info!(%server, "connected to SideWire host");
-                if let Err(error) = serve(stream, name, device_id, false).await {
+                if let Err(error) =
+                    serve(stream, name, device_id, false, security, pairs_dir.clone()).await
+                {
                     tracing::warn!(%error, "host connection ended");
                 }
                 delay = 1;
@@ -227,15 +320,29 @@ async fn serve(
     name: &str,
     device_id: DeviceId,
     inbound: bool,
+    security_mode: SecurityMode,
+    pairs_dir: Option<String>,
 ) -> Result<()> {
+    let secured = if inbound {
+        security::accept_connection(&mut stream, device_id, security_mode, pairs_dir.as_deref())
+            .await?
+    } else {
+        security::connect_connection(&mut stream, device_id, security_mode, pairs_dir.as_deref())
+            .await?
+    };
+    let noise = secured.noise.clone();
+    let shared_secret = secured.shared_secret;
     if inbound {
-        let hello_frame = read_frame(&mut stream).await?;
+        let hello_frame = {
+            let mut reader = SecureFrameReader::new(&mut stream, noise.clone());
+            reader.read_frame().await?
+        };
         if hello_frame.kind != FrameKind::Hello {
             bail!("expected host Hello");
         }
         let hello: sidewire_protocol::Hello = decode(&hello_frame.payload)?;
-        tracing::info!(peer = %hello.name, "handshake complete");
-        send_ack(&mut stream, name, device_id).await?;
+        tracing::info!(peer = %hello.name, host_id = %secured.peer_id.short(), security = security_mode.as_str(), "handshake complete");
+        send_ack(&mut stream, name, device_id, noise.clone()).await?;
     } else {
         let hello = sidewire_protocol::Hello {
             device_id: Some(device_id),
@@ -243,15 +350,24 @@ async fn serve(
             role: sidewire_protocol::PeerRole::Device,
             protocol_version: sidewire_protocol::VERSION,
         };
-        write_frame(&mut stream, &frame(FrameKind::Hello, 0, &hello)?).await?;
-        let ack = read_frame(&mut stream).await?;
+        {
+            let mut writer = SecureFrameWriter::new(&mut stream, noise.clone());
+            writer
+                .write_frame(&frame(FrameKind::Hello, 0, &hello)?)
+                .await?;
+        }
+        let ack = {
+            let mut reader = SecureFrameReader::new(&mut stream, noise.clone());
+            reader.read_frame().await?
+        };
         if ack.kind != FrameKind::HelloAck {
             bail!("expected host HelloAck");
         }
     }
 
-    let (mut reader, writer_half) = stream.into_split();
-    let writer = MuxWriter::new(writer_half);
+    let (reader_half, writer_half) = stream.into_split();
+    let mut reader = SecureFrameReader::new(reader_half, noise.clone());
+    let writer = MuxWriter::new(writer_half, noise);
     let routes: StreamRoutes = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let proxies = Arc::new(tokio::sync::Mutex::new(HashMap::<
         String,
@@ -260,7 +376,7 @@ async fn serve(
 
     let result: Result<()> = async {
         loop {
-            let request = read_frame(&mut reader).await?;
+            let request = reader.read_frame().await?;
             let routed = { routes.lock().await.get(&request.stream_id).cloned() };
             if let Some(sender) = routed {
                 let stream_id = request.stream_id;
@@ -322,7 +438,7 @@ async fn serve(
                     tokio::spawn(async move {
                         let result: Result<()> = async {
                             let req: ProxyStartRequest = decode(&request.payload)?;
-                            let (ack, task) = start_proxy(&req).await?;
+                            let (ack, task) = start_proxy(&req, shared_secret).await?;
                             if let Some(old) = proxies.lock().await.insert(req.id.clone(), task) {
                                 old.abort();
                             }
@@ -357,14 +473,22 @@ async fn serve(
     }
     result
 }
-async fn send_ack(stream: &mut TcpStream, name: &str, device_id: DeviceId) -> Result<()> {
+async fn send_ack(
+    stream: &mut TcpStream,
+    name: &str,
+    device_id: DeviceId,
+    noise: Option<sidewire_protocol::SharedNoise>,
+) -> Result<()> {
     let ack = HelloAck {
         device_id: Some(device_id),
         name: name.to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
     };
-    write_frame(stream, &frame(FrameKind::HelloAck, 0, &ack)?).await
+    let mut writer = SecureFrameWriter::new(stream, noise);
+    writer
+        .write_frame(&frame(FrameKind::HelloAck, 0, &ack)?)
+        .await
 }
 
 #[cfg(target_os = "android")]
@@ -1021,6 +1145,7 @@ fn sanitize_shell_hostname(value: &str) -> Option<String> {
 
 async fn start_proxy(
     request: &ProxyStartRequest,
+    shared_secret: Option<[u8; 32]>,
 ) -> Result<(ProxyStartAck, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(&request.bind)
         .await
@@ -1042,32 +1167,64 @@ async fn start_proxy(
                 let result: Result<()> = async {
                     match mode {
                         ProxyTokenMode::Expect => {
-                            let mut received = vec![0u8; token.len()];
-                            incoming.read_exact(&mut received).await?;
-                            if received != token {
-                                bail!("proxy token mismatch");
-                            }
                             let mut outgoing = TcpStream::connect(&target).await?;
                             outgoing.set_nodelay(true)?;
-                            tokio::io::copy_bidirectional_with_sizes(
-                                &mut incoming,
-                                &mut outgoing,
-                                PROXY_BUFFER_SIZE,
-                                PROXY_BUFFER_SIZE,
-                            )
-                            .await?;
+                            if let Some(secret) = shared_secret {
+                                let prologue = sidewire_protocol::proxy_prologue(&token, "forward");
+                                let noise = sidewire_protocol::noise_responder(
+                                    &mut incoming,
+                                    &secret,
+                                    &prologue,
+                                )
+                                .await?;
+                                sidewire_protocol::copy_noise_tunnel(
+                                    &mut outgoing,
+                                    &mut incoming,
+                                    noise,
+                                )
+                                .await?;
+                            } else {
+                                let mut received = vec![0u8; token.len()];
+                                incoming.read_exact(&mut received).await?;
+                                if received != token {
+                                    bail!("proxy token mismatch");
+                                }
+                                tokio::io::copy_bidirectional_with_sizes(
+                                    &mut incoming,
+                                    &mut outgoing,
+                                    PROXY_BUFFER_SIZE,
+                                    PROXY_BUFFER_SIZE,
+                                )
+                                .await?;
+                            }
                         }
                         ProxyTokenMode::Send => {
                             let mut outgoing = TcpStream::connect(&target).await?;
                             outgoing.set_nodelay(true)?;
-                            outgoing.write_all(&token).await?;
-                            tokio::io::copy_bidirectional_with_sizes(
-                                &mut incoming,
-                                &mut outgoing,
-                                PROXY_BUFFER_SIZE,
-                                PROXY_BUFFER_SIZE,
-                            )
-                            .await?;
+                            if let Some(secret) = shared_secret {
+                                let prologue = sidewire_protocol::proxy_prologue(&token, "reverse");
+                                let noise = sidewire_protocol::noise_initiator(
+                                    &mut outgoing,
+                                    &secret,
+                                    &prologue,
+                                )
+                                .await?;
+                                sidewire_protocol::copy_noise_tunnel(
+                                    &mut incoming,
+                                    &mut outgoing,
+                                    noise,
+                                )
+                                .await?;
+                            } else {
+                                outgoing.write_all(&token).await?;
+                                tokio::io::copy_bidirectional_with_sizes(
+                                    &mut incoming,
+                                    &mut outgoing,
+                                    PROXY_BUFFER_SIZE,
+                                    PROXY_BUFFER_SIZE,
+                                )
+                                .await?;
+                            }
                         }
                     }
                     Ok(())

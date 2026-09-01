@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 postcard.workspace = true
 serde.workspace = true
+snow.workspace = true
 tokio.workspace = true
