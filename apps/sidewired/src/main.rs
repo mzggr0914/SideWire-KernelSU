@@ -6,12 +6,14 @@ use sidewire_protocol::{
     raw_frame, read_frame, write_frame,
 };
 #[cfg(target_os = "android")]
-use sidewire_protocol::{PtyCompleteRequest, PtyCompleteResult, PtyExit, PtyOpenAck, PtyResize};
+use sidewire_protocol::{PtyCompleteRequest, PtyExit, PtyOpenAck, PtyResize};
 #[cfg(target_os = "android")]
 use std::fs::File as StdFile;
 #[cfg(target_os = "android")]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::{collections::HashMap, fs, process::Stdio};
+mod completion;
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -659,116 +661,6 @@ fn terminate_pty_group(pid: u32) {
     }
 }
 
-#[cfg(target_os = "android")]
-fn completion_token_start(line: &str, cursor: usize) -> usize {
-    let mut start = 0usize;
-    let mut quote = None;
-    for (index, character) in line[..cursor].char_indices() {
-        match quote {
-            Some(active) if character == active => quote = None,
-            Some(_) => {}
-            None if matches!(character, '\'' | '"') => {
-                quote = Some(character);
-                if start == index {
-                    start = index + character.len_utf8();
-                }
-            }
-            None if character.is_whitespace() || "|;&()<>".contains(character) => {
-                start = index + character.len_utf8();
-            }
-            None => {}
-        }
-    }
-    start
-}
-
-#[cfg(target_os = "android")]
-fn common_completion_prefix(values: &[String]) -> String {
-    let Some(first) = values.first() else {
-        return String::new();
-    };
-    let mut prefix = first.clone();
-    for value in &values[1..] {
-        while !value.starts_with(&prefix) {
-            if prefix.pop().is_none() {
-                break;
-            }
-        }
-        if prefix.is_empty() {
-            break;
-        }
-    }
-    prefix
-}
-
-#[cfg(target_os = "android")]
-fn complete_pty_path(pid: u32, request: &PtyCompleteRequest) -> Result<PtyCompleteResult> {
-    let mut cursor = (request.cursor as usize).min(request.line.len());
-    while cursor > 0 && !request.line.is_char_boundary(cursor) {
-        cursor -= 1;
-    }
-    let start = completion_token_start(&request.line, cursor);
-    let typed = &request.line[start..cursor];
-    let split = typed.rfind('/').map(|index| index + 1).unwrap_or(0);
-    let (directory_text, needle) = typed.split_at(split);
-
-    let cwd = fs::read_link(format!("/proc/{pid}/cwd"))
-        .with_context(|| format!("read PTY cwd for pid {pid}"))?;
-    let search_dir = if directory_text.starts_with('/') {
-        std::path::PathBuf::from(if directory_text.is_empty() {
-            "/"
-        } else {
-            directory_text
-        })
-    } else if directory_text.is_empty() {
-        cwd
-    } else {
-        cwd.join(directory_text)
-    };
-
-    let mut candidates = Vec::new();
-    for entry in fs::read_dir(&search_dir)
-        .with_context(|| format!("read completion directory {}", search_dir.display()))?
-    {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(needle) {
-            continue;
-        }
-        let mut candidate = format!("{directory_text}{name}");
-        if entry
-            .metadata()
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false)
-        {
-            candidate.push('/');
-        }
-        candidates.push(candidate);
-    }
-    candidates.sort();
-
-    let replacement = match candidates.len() {
-        0 => typed.to_owned(),
-        1 => candidates.remove(0),
-        _ => {
-            let prefix = common_completion_prefix(&candidates);
-            if prefix.len() > typed.len() {
-                prefix
-            } else {
-                typed.to_owned()
-            }
-        }
-    };
-
-    let mut line = request.line.clone();
-    line.replace_range(start..cursor, &replacement);
-    let cursor = start + replacement.len();
-    Ok(PtyCompleteResult {
-        line,
-        cursor: cursor as u32,
-    })
-}
-
 async fn handle_pty(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> Result<()> {
     let request: PtyOpenRequest = decode(payload)?;
     #[cfg(not(target_os = "android"))]
@@ -866,7 +758,7 @@ async fn handle_pty(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> R
                             }
                             FrameKind::PtyComplete => {
                                 let request: PtyCompleteRequest = decode(&incoming.payload)?;
-                                let completion = complete_pty_path(pid, &request)?;
+                                let completion = completion::complete_pty_path(pid, &request)?;
                                 let mut writer = net_write.lock().await;
                                 write_frame(
                                     &mut *writer,
