@@ -2,6 +2,7 @@
 /target-*/
 /webui/node_modules/
 /webui/dist/
+/module/webroot/
 /dist/
 /*.exe
 /*.zip

@@ -1,6 +1,0 @@
-import fs from 'node:fs';
-const p='apps/sidewire/src/main.rs';
-let s=fs.readFileSync(p,'utf8');
-s=s.replace('                                if local.kind == FrameKind::PtyClose {\n                                    break;\n                                }','                                if local.kind == FrameKind::PtyClose {\n                                    loop {\n                                        let remote = read_frame(&mut *device_stream).await?;\n                                        if remote.stream_id == stream_id && matches!(remote.kind, FrameKind::PtyExit | FrameKind::Error) { break; }\n                                    }\n                                    break;\n                                }');
-s=s.replace('                        let _ = write_frame(&mut *device_stream, &close).await;\n                        break;','                        let _ = write_frame(&mut *device_stream, &close).await;\n                        while let Ok(remote) = read_frame(&mut *device_stream).await {\n                            if remote.stream_id == stream_id && matches!(remote.kind, FrameKind::PtyExit | FrameKind::Error) { break; }\n                        }\n                        break;');
-fs.writeFileSync(p,s);
