@@ -4,7 +4,7 @@ use std::io::IoSlice;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAGIC: [u8; 4] = *b"SIDE";
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 pub const HEADER_LEN: usize = 16;
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 

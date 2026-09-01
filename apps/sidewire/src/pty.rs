@@ -6,13 +6,21 @@ enum ConsoleEvent {
         cols: u16,
         rows: u16,
     },
+    #[cfg(windows)]
     Complete {
         line: String,
         cursor: usize,
         reply: std::sync::mpsc::SyncSender<Option<PtyCompleteResult>>,
     },
     Error(String),
+    #[cfg(windows)]
     Eof,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct LineDisplayState {
+    prompt_tail: std::sync::Mutex<String>,
 }
 
 struct RawModeGuard;
@@ -21,6 +29,74 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
     }
+}
+
+#[cfg(windows)]
+fn update_prompt_tail(state: &LineDisplayState, payload: &[u8]) {
+    let text = String::from_utf8_lossy(payload);
+    let last_break = text
+        .char_indices()
+        .filter(|(_, character)| matches!(character, '\r' | '\n'))
+        .map(|(index, character)| index + character.len_utf8())
+        .next_back();
+    let mut tail = state
+        .prompt_tail
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(start) = last_break {
+        tail.clear();
+        tail.push_str(&text[start..]);
+    } else {
+        tail.push_str(&text);
+    }
+    if tail.len() > 512 {
+        let mut start = tail.len() - 512;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        *tail = tail[start..].to_owned();
+    }
+}
+
+#[cfg(any(windows, test))]
+fn format_completion_candidates(
+    candidates: &[String],
+    candidate_count: u32,
+    terminal_width: u16,
+) -> String {
+    if candidates.is_empty() {
+        return String::new();
+    }
+    let max_chars = candidates
+        .iter()
+        .map(|candidate| candidate.chars().count())
+        .max()
+        .unwrap_or(1);
+    let column_width = (max_chars + 2).max(2);
+    let columns = ((terminal_width as usize).max(1) / column_width).max(1);
+    let rows = candidates.len().div_ceil(columns);
+    let mut output = String::new();
+    for row in 0..rows {
+        for column in 0..columns {
+            let index = column * rows + row;
+            let Some(candidate) = candidates.get(index) else {
+                continue;
+            };
+            output.push_str(candidate);
+            if column + 1 < columns && index + rows < candidates.len() {
+                let padding = column_width.saturating_sub(candidate.chars().count());
+                output.extend(std::iter::repeat_n(' ', padding));
+            }
+        }
+        if row + 1 < rows {
+            output.push_str("\r\n");
+        }
+    }
+    let shown = candidates.len() as u32;
+    if candidate_count > shown {
+        output.push_str(&format!("\r\n... {} more", candidate_count - shown));
+    }
+    output
 }
 
 #[cfg(not(windows))]
@@ -96,10 +172,10 @@ fn spawn_console_reader(
             }
             match read() {
                 Ok(Event::Key(key)) => {
-                    if let Some(bytes) = key_bytes(key) {
-                        if tx.send(ConsoleEvent::Input(bytes)).is_err() {
-                            break;
-                        }
+                    if let Some(bytes) = key_bytes(key)
+                        && tx.send(ConsoleEvent::Input(bytes)).is_err()
+                    {
+                        break;
                     }
                 }
                 Ok(Event::Resize(cols, rows)) => {
@@ -249,6 +325,7 @@ pub(super) async fn run_pty_client(
                     let resize = frame(FrameKind::PtyResize, stream_id, &PtyResize { cols, rows })?;
                     write_frame(&mut net_write, &resize).await?;
                 }
+                #[cfg(windows)]
                 ConsoleEvent::Complete { reply, .. } => {
                     let _ = reply.send(None);
                 }
@@ -257,6 +334,7 @@ pub(super) async fn run_pty_client(
                         write_raw_frame(&mut net_write, FrameKind::PtyClose, stream_id, &[]).await;
                     bail!(message);
                 }
+                #[cfg(windows)]
                 ConsoleEvent::Eof => {
                     write_raw_frame(&mut net_write, FrameKind::PtyClose, stream_id, &[]).await?;
                     return Ok::<(), anyhow::Error>(());
@@ -304,11 +382,7 @@ pub(super) async fn run_pty_client(
     result
 }
 
-#[cfg(not(windows))]
-fn spawn_line_reader(stop: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSender<ConsoleEvent>) {
-    spawn_standard_line_reader(stop, tx);
-}
-
+#[cfg(windows)]
 fn spawn_standard_line_reader(
     stop: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::UnboundedSender<ConsoleEvent>,
@@ -344,6 +418,7 @@ fn spawn_standard_line_reader(
     spawn_line_resize_reader(stop, tx);
 }
 
+#[cfg(windows)]
 fn spawn_line_resize_reader(
     stop: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::UnboundedSender<ConsoleEvent>,
@@ -437,7 +512,11 @@ fn write_windows_console(text: &str) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn spawn_line_reader(stop: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSender<ConsoleEvent>) {
+fn spawn_line_reader(
+    stop: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::UnboundedSender<ConsoleEvent>,
+    display: Arc<LineDisplayState>,
+) {
     const STD_INPUT_HANDLE: u32 = -10i32 as u32;
     const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
     const TAB: u16 = 0x09;
@@ -464,6 +543,7 @@ fn spawn_line_reader(stop: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSend
         };
         let mut buffer = vec![0u16; BUFFER_CHARS];
         let mut keep = 0usize;
+        let mut last_completion: Option<(String, usize)> = None;
         while !input_stop.load(Ordering::Relaxed) {
             if keep >= buffer.len() - 1 {
                 let _ = input_tx.send(ConsoleEvent::Error("console input line is too long".into()));
@@ -508,6 +588,7 @@ fn spawn_line_reader(stop: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSend
                 line.push_str(&suffix);
 
                 if tab_index + 1 != count {
+                    last_completion = None;
                     let wide: Vec<u16> = line.encode_utf16().collect();
                     if wide.len() >= buffer.len() {
                         let _ = input_tx
@@ -519,11 +600,12 @@ fn spawn_line_reader(stop: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSend
                     continue;
                 }
 
+                let requested_cursor = prefix.len();
                 let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
                 if input_tx
                     .send(ConsoleEvent::Complete {
-                        line,
-                        cursor: prefix.len(),
+                        line: line.clone(),
+                        cursor: requested_cursor,
                         reply: reply_tx,
                     })
                     .is_err()
@@ -535,18 +617,47 @@ fn spawn_line_reader(stop: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSend
                     Ok(None) | Err(_) => break,
                 };
                 let completed_cursor = (completed.cursor as usize).min(completed.line.len());
-                let new_prefix = completed
-                    .line
-                    .get(..completed_cursor)
-                    .unwrap_or(&completed.line);
-                if let Some(addition) = new_prefix.strip_prefix(&prefix)
-                    && let Err(error) = write_windows_console(addition)
-                {
-                    let _ = input_tx.send(ConsoleEvent::Error(format!(
-                        "write completion to console failed: {error}"
-                    )));
-                    break;
+                let show_candidates = completed.candidate_count > 1
+                    && last_completion
+                        .as_ref()
+                        .is_some_and(|(last_line, last_cursor)| {
+                            last_line == &line && *last_cursor == requested_cursor
+                        });
+                if show_candidates {
+                    let width = crossterm::terminal::size().map(|size| size.0).unwrap_or(80);
+                    let listing = format_completion_candidates(
+                        &completed.candidates,
+                        completed.candidate_count,
+                        width,
+                    );
+                    let prompt = display
+                        .prompt_tail
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    let redraw = format!("\r\n{listing}\r\n{prompt}{}", completed.line);
+                    if let Err(error) = write_windows_console(&redraw) {
+                        let _ = input_tx.send(ConsoleEvent::Error(format!(
+                            "write completion candidates to console failed: {error}"
+                        )));
+                        break;
+                    }
+                } else {
+                    let new_prefix = completed
+                        .line
+                        .get(..completed_cursor)
+                        .unwrap_or(&completed.line);
+                    if let Some(addition) = new_prefix.strip_prefix(&prefix)
+                        && let Err(error) = write_windows_console(addition)
+                    {
+                        let _ = input_tx.send(ConsoleEvent::Error(format!(
+                            "write completion to console failed: {error}"
+                        )));
+                        break;
+                    }
                 }
+                last_completion = (completed.candidate_count > 1)
+                    .then(|| (completed.line.clone(), completed_cursor));
 
                 let wide: Vec<u16> = completed.line.encode_utf16().collect();
                 if wide.len() >= buffer.len() {
@@ -560,6 +671,7 @@ fn spawn_line_reader(stop: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSend
                 continue;
             }
 
+            last_completion = None;
             let line = String::from_utf16_lossy(&buffer[..count]);
             if input_tx
                 .send(ConsoleEvent::Input(normalize_console_line(line.as_bytes())))
@@ -579,6 +691,7 @@ fn spawn_line_reader(stop: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSend
 /// Windows cooked console input ends submitted lines with CRLF. Forwarding
 /// both bytes to an Android PTY with ICRNL enabled turns them into two newline
 /// characters, so mksh executes an extra empty command and prints two prompts.
+#[cfg(any(windows, test))]
 fn normalize_console_line(line: &[u8]) -> Vec<u8> {
     let Some(without_lf) = line.strip_suffix(b"\n") else {
         return line.to_vec();
@@ -630,6 +743,7 @@ async fn open_pty_control(
     }
 }
 
+#[cfg(windows)]
 async fn run_pty_line_client(
     control: &str,
     device: Option<String>,
@@ -640,8 +754,9 @@ async fn run_pty_line_client(
     let reader = open_pty_control(control, device, run_as, program, args, false).await?;
     let stream_id = 0x5054_5901;
     let stop = Arc::new(AtomicBool::new(false));
+    let display = Arc::new(LineDisplayState::default());
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-    spawn_line_reader(stop.clone(), event_tx);
+    spawn_line_reader(stop.clone(), event_tx, display.clone());
     let (mut net_read, mut net_write) = tokio::io::split(reader);
     let (remote_tx, mut remote_rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
@@ -696,7 +811,11 @@ async fn run_pty_line_client(
             }
             remote = remote_rx.recv() => match remote {
                 Some(Ok(frame)) => match frame.kind {
-                    FrameKind::PtyOutput => { stdout.write_all(&frame.payload)?; stdout.flush()?; }
+                    FrameKind::PtyOutput => {
+                        update_prompt_tail(&display, &frame.payload);
+                        stdout.write_all(&frame.payload)?;
+                        stdout.flush()?;
+                    }
                     FrameKind::PtyCompleteResult => {
                         let completion: PtyCompleteResult = decode(&frame.payload)?;
                         if let Some(reply) = completion_reply.take() {
@@ -779,11 +898,19 @@ pub(super) async fn run_shell(
         return run_pty_probe(control, device, run_as).await;
     }
     if raw {
+        return run_pty_client(control, device, run_as, "/system/bin/sh".into(), Vec::new()).await;
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix terminals already provide a good raw PTY experience, so keep the
+        // remote shell's native editor/history/completion enabled by default.
         run_pty_client(control, device, run_as, "/system/bin/sh".into(), Vec::new()).await
-    } else {
+    }
+    #[cfg(windows)]
+    {
         // The Windows console already echoes and edits cooked line input. Turn
         // off mksh's remote editor so the submitted command is not drawn a
-        // second time; raw mode keeps it enabled for history and completion.
+        // second time; SideWire handles Tab completion locally in this mode.
         run_pty_line_client(
             control,
             device,
@@ -797,7 +924,7 @@ pub(super) async fn run_shell(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_console_line;
+    use super::{format_completion_candidates, normalize_console_line};
 
     #[test]
     fn normalizes_windows_console_crlf_to_one_pty_enter() {
@@ -814,5 +941,15 @@ mod tests {
     #[test]
     fn leaves_unterminated_input_unchanged() {
         assert_eq!(normalize_console_line(b"exit"), b"exit");
+    }
+
+    #[test]
+    fn formats_completion_candidates_in_columns_and_reports_truncation() {
+        let candidates = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        let output = format_completion_candidates(&candidates, 5, 16);
+        assert!(output.contains("alpha"));
+        assert!(output.contains("beta"));
+        assert!(output.contains("gamma"));
+        assert!(output.contains("... 2 more"));
     }
 }

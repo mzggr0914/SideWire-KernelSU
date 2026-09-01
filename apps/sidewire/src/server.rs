@@ -100,9 +100,16 @@ pub(super) enum ControlResponse {
         message: String,
     },
 }
-pub(super) async fn run_server(bind: &str, control: &str) -> Result<()> {
+pub(super) async fn run_server(bind: &str, control: &str, connect: Vec<String>) -> Result<()> {
     let devices: DeviceMap = Arc::new(RwLock::new(HashMap::new()));
-    tracing::info!(%bind, %control, "SideWire server starting");
+    tracing::info!(%bind, %control, inbound_targets = connect.len(), "SideWire server starting");
+
+    for endpoint in connect {
+        let devices = devices.clone();
+        tokio::spawn(async move {
+            device_connector(endpoint, devices).await;
+        });
+    }
 
     let device_task = device_listener(bind, devices.clone());
     let control_task = control_listener(control, devices);
@@ -157,6 +164,68 @@ async fn accept_device(stream: &mut TcpStream) -> Result<String> {
     write_frame(stream, &frame(FrameKind::HelloAck, 0, &ack)?).await?;
     Ok(hello.name)
 }
+
+async fn connect_device(stream: &mut TcpStream) -> Result<String> {
+    let hello = Hello {
+        name: "sidewire-server".into(),
+        role: sidewire_protocol::PeerRole::Host,
+        protocol_version: sidewire_protocol::VERSION,
+    };
+    write_frame(stream, &frame(FrameKind::Hello, 0, &hello)?).await?;
+    let ack_frame = read_frame(stream).await?;
+    if ack_frame.kind != FrameKind::HelloAck {
+        bail!("expected device HelloAck");
+    }
+    let ack: HelloAck = decode(&ack_frame.payload)?;
+    if ack.name.trim().is_empty() {
+        bail!("device returned an empty name");
+    }
+    Ok(ack.name)
+}
+
+async fn device_connector(endpoint: String, devices: DeviceMap) {
+    let mut delay = 1u64;
+    loop {
+        tracing::info!(%endpoint, "connecting to inbound SideWire device");
+        match TcpStream::connect(&endpoint).await {
+            Ok(mut stream) => {
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::warn!(%endpoint, %error, "failed to enable TCP_NODELAY");
+                }
+                let peer = stream.peer_addr();
+                let local = stream.local_addr();
+                match (peer, local, connect_device(&mut stream).await) {
+                    (Ok(peer), Ok(local), Ok(name)) => {
+                        let peer_text = peer.to_string();
+                        tracing::info!(device = %name, peer = %peer_text, %endpoint, "inbound device connected");
+                        let transport = DeviceTransport::new(stream);
+                        let session = DeviceSession {
+                            peer: peer_text,
+                            device_ip: peer.ip(),
+                            local_ip: local.ip(),
+                            transport: transport.clone(),
+                        };
+                        devices.write().await.insert(name.clone(), session.clone());
+                        delay = 1;
+                        transport.wait_closed().await;
+                        remove_device_if_same(&devices, &name, &session).await;
+                        tracing::warn!(device = %name, %endpoint, "inbound device connection ended");
+                    }
+                    (_, _, Err(error)) => {
+                        tracing::warn!(%endpoint, %error, "inbound device handshake failed");
+                    }
+                    (Err(error), _, _) | (_, Err(error), _) => {
+                        tracing::warn!(%endpoint, %error, "could not inspect inbound device socket");
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%endpoint, %error, "inbound device connect failed"),
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+        delay = (delay * 2).min(30);
+    }
+}
+
 async fn control_listener(control: &str, devices: DeviceMap) -> Result<()> {
     let listener = TcpListener::bind(control)
         .await

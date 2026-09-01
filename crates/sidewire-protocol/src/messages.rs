@@ -108,6 +108,8 @@ pub struct PtyCompleteRequest {
 pub struct PtyCompleteResult {
     pub line: String,
     pub cursor: u32,
+    pub candidates: Vec<String>,
+    pub candidate_count: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

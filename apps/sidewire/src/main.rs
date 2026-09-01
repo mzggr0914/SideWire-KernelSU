@@ -3,10 +3,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sidewire_protocol::{
     ExecExit, ExecIdentity, ExecRequest, FileMeta, FilePullRequest, FilePushRequest, FrameKind,
-    Hello, HelloAck, ProxyStartAck, ProxyStartRequest, ProxyTokenMode, PtyCompleteRequest,
-    PtyCompleteResult, PtyExit, PtyOpenAck, PtyOpenRequest, PtyResize, decode, frame, raw_frame,
-    read_frame, write_frame, write_raw_frame,
+    Hello, HelloAck, ProxyStartAck, ProxyStartRequest, ProxyTokenMode, PtyExit, PtyOpenAck,
+    PtyOpenRequest, PtyResize, decode, frame, raw_frame, read_frame, write_frame, write_raw_frame,
 };
+#[cfg(windows)]
+use sidewire_protocol::{PtyCompleteRequest, PtyCompleteResult};
 use std::{
     collections::HashMap,
     io::{self, Write},
@@ -62,6 +63,9 @@ enum Command {
         bind: String,
         #[arg(long, default_value = DEFAULT_CONTROL)]
         control: String,
+        /// Connect to an Android daemon running in inbound mode. Repeat for multiple devices.
+        #[arg(long = "connect", value_name = "HOST:PORT")]
+        connect: Vec<String>,
     },
     Devices {
         #[arg(long, default_value = DEFAULT_CONTROL)]
@@ -207,7 +211,11 @@ enum AppCommand {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     match Cli::parse().command {
-        Command::Server { bind, control } => server::run_server(&bind, &control).await,
+        Command::Server {
+            bind,
+            control,
+            connect,
+        } => server::run_server(&bind, &control, connect).await,
         Command::Devices { control } => client::run_devices(&control).await,
         Command::Exec {
             control,

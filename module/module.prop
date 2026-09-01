@@ -1,6 +1,6 @@
 id=sidewire
 name=SideWire
-version=0.5.7
-versionCode=13
+version=0.6.0
+versionCode=14
 author=SideWire contributors
 description=Native Android bridge with clean PTY line input, Android device prompts, optional raw input, root/shell execution, file transfer, app tools, and TCP forwarding.

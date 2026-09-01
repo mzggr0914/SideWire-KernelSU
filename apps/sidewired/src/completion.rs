@@ -30,6 +30,8 @@ static DIRECTORY_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedDirectory>>> = Onc
 const DIRECTORY_CACHE_TTL: Duration = Duration::from_millis(750);
 #[cfg(target_os = "android")]
 const DIRECTORY_CACHE_LIMIT: usize = 64;
+#[cfg(target_os = "android")]
+const MAX_COMPLETION_CANDIDATES: usize = 256;
 
 #[cfg(any(target_os = "android", test))]
 fn completion_token_start(line: &str, cursor: usize) -> usize {
@@ -158,6 +160,7 @@ pub(super) fn complete_pty_path(
     let mut matches = 0usize;
     let mut first = None;
     let mut prefix = String::new();
+    let mut candidates = Vec::new();
     let entries = completion_entries(&search_dir)?;
     for entry in entries.iter() {
         if !entry.name.starts_with(needle) {
@@ -171,10 +174,11 @@ pub(super) fn complete_pty_path(
         matches += 1;
         if matches == 1 {
             prefix.clone_from(&candidate);
-            first = Some(candidate);
+            first = Some(candidate.clone());
         } else {
             shrink_common_prefix(&mut prefix, &candidate);
         }
+        candidates.push(candidate);
     }
 
     let replacement = match matches {
@@ -183,6 +187,9 @@ pub(super) fn complete_pty_path(
         _ if prefix.len() > typed.len() => prefix,
         _ => typed.to_owned(),
     };
+    candidates.sort_unstable();
+    let candidate_count = candidates.len() as u32;
+    candidates.truncate(MAX_COMPLETION_CANDIDATES);
 
     let mut line = request.line.clone();
     line.replace_range(start..cursor, &replacement);
@@ -190,6 +197,8 @@ pub(super) fn complete_pty_path(
     Ok(PtyCompleteResult {
         line,
         cursor: cursor as u32,
+        candidates,
+        candidate_count,
     })
 }
 
