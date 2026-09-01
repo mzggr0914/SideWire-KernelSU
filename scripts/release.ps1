@@ -19,6 +19,10 @@ $customize = Get-Content (Join-Path $root "module\customize.sh") -Raw
 if ($customize -notmatch "SideWire $([regex]::Escape($version))") {
     throw "module/customize.sh version does not match Cargo.toml ($version)"
 }
+$webUiPackage = Get-Content (Join-Path $root "webui\package.json") -Raw | ConvertFrom-Json
+if ($webUiPackage.version -ne $version) {
+    throw "webui/package.json version does not match Cargo.toml ($version)"
+}
 
 if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot "build.ps1")
