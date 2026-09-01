@@ -1,0 +1,10 @@
+import fs from 'node:fs';
+let cargo=fs.readFileSync('Cargo.toml','utf8');
+cargo=cargo.replace('version = "0.3.0"','version = "0.3.1"');
+fs.writeFileSync('Cargo.toml',cargo);
+const p='apps/sidewired/src/main.rs';
+let s=fs.readFileSync(p,'utf8');
+const a=s.indexOf('#[cfg(target_os = "android")]\nfn enter_daemon_context()');
+const b=a>=0?s.indexOf('\nasync fn run_inbound',a):-1;
+if(a>=0&&b>=0) s=s.slice(0,a)+s.slice(b+1);
+fs.writeFileSync(p,s);

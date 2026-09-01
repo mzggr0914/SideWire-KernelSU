@@ -1,0 +1,56 @@
+async fn process_control(request: ControlRequest, devices: &DeviceMap) -> ControlResponse {
+    match request {
+        ControlRequest::Devices => {
+            let guard = devices.read().await;
+            let mut list: Vec<DeviceInfo> = guard.iter().map(|(name, session)| DeviceInfo {
+                name: name.clone(),
+                peer: session.peer.clone(),
+            }).collect();
+            list.sort_by(|a, b| a.name.cmp(&b.name));
+            ControlResponse::Devices { devices: list }
+        }
+        ControlRequest::Exec { device, program, args, cwd, run_as } =>
+            match resolve_device(devices, device.as_deref()).await {
+                Ok((name, session)) => match remote_exec(&session, program, args, cwd, run_as).await {
+                    Ok((stdout, stderr, code)) => ControlResponse::Exec { stdout, stderr, code },
+                    Err(error) => {
+                        remove_device_if_same(devices, &name, &session).await;
+                        ControlResponse::Error { message: error.to_string() }
+                    }
+                },
+                Err(error) => ControlResponse::Error { message: error.to_string() },
+            },
+        ControlRequest::Push { device, local, remote, run_as } =>
+            match resolve_device(devices, device.as_deref()).await {
+                Ok((_, session)) => match remote_push(&session, &local, remote, run_as).await {
+                    Ok(bytes) => ControlResponse::Ok { message: format!("pushed {bytes} bytes") },
+                    Err(error) => ControlResponse::Error { message: error.to_string() },
+                },
+                Err(error) => ControlResponse::Error { message: error.to_string() },
+            },
+        ControlRequest::Pull { device, remote, local, run_as } =>
+            match resolve_device(devices, device.as_deref()).await {
+                Ok((_, session)) => match remote_pull(&session, remote, &local, run_as).await {
+                    Ok(bytes) => ControlResponse::Ok { message: format!("pulled {bytes} bytes") },
+                    Err(error) => ControlResponse::Error { message: error.to_string() },
+                },
+                Err(error) => ControlResponse::Error { message: error.to_string() },
+            },
+        ControlRequest::Forward { device, local_port, remote_port } =>
+            match resolve_device(devices, device.as_deref()).await {
+                Ok((_, session)) => match start_forward(&session, local_port, remote_port).await {
+                    Ok(message) => ControlResponse::Ok { message },
+                    Err(error) => ControlResponse::Error { message: error.to_string() },
+                },
+                Err(error) => ControlResponse::Error { message: error.to_string() },
+            },
+        ControlRequest::Reverse { device, device_port, host_port } =>
+            match resolve_device(devices, device.as_deref()).await {
+                Ok((_, session)) => match start_reverse(&session, device_port, host_port).await {
+                    Ok(message) => ControlResponse::Ok { message },
+                    Err(error) => ControlResponse::Error { message: error.to_string() },
+                },
+                Err(error) => ControlResponse::Error { message: error.to_string() },
+            },
+    }
+}

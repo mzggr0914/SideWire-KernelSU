@@ -1,0 +1,91 @@
+async fn handle_control_pty(
+    mut reader: BufReader<TcpStream>,
+    devices: &DeviceMap,
+    device: Option<String>,
+    program: String,
+    args: Vec<String>,
+    run_as: RunAs,
+    cols: u16,
+    rows: u16,
+    term: String,
+) -> Result<()> {
+    let (_, session) = resolve_device(devices, device.as_deref()).await?;
+    let mut device_stream = session.stream.lock().await;
+    let stream_id = 0x5054_5901;
+    let request = PtyOpenRequest {
+        program,
+        args,
+        identity: run_as.into(),
+        cols,
+        rows,
+        term,
+    };
+    write_frame(
+        &mut *device_stream,
+        &frame(FrameKind::PtyOpen, stream_id, &request)?,
+    )
+    .await?;
+    let opened = read_frame(&mut *device_stream).await?;
+    match opened.kind {
+        FrameKind::PtyOpenAck => {
+            let ack: PtyOpenAck = decode(&opened.payload)?;
+            let response = ControlResponse::Ok {
+                message: format!("pty pid={}", ack.pid),
+            };
+            let mut encoded = serde_json::to_vec(&response)?;
+            encoded.push(b'\n');
+            reader.get_mut().write_all(&encoded).await?;
+            reader.get_mut().flush().await?;
+        }
+        FrameKind::Error => {
+            let response = ControlResponse::Error {
+                message: String::from_utf8_lossy(&opened.payload).into_owned(),
+            };
+            let mut encoded = serde_json::to_vec(&response)?;
+            encoded.push(b'\n');
+            reader.get_mut().write_all(&encoded).await?;
+            reader.get_mut().flush().await?;
+            return Ok(());
+        }
+        kind => bail!("unexpected PTY open response {kind:?}"),
+    }
+
+    loop {
+        tokio::select! {
+            local = read_frame(&mut reader) => {
+                match local {
+                    Ok(mut local) => {
+                        match local.kind {
+                            FrameKind::PtyInput | FrameKind::PtyResize | FrameKind::PtyClose => {
+                                local.stream_id = stream_id;
+                                write_frame(&mut *device_stream, &local).await?;
+                                if local.kind == FrameKind::PtyClose {
+                                    break;
+                                }
+                            }
+                            kind => bail!("unexpected local PTY frame {kind:?}"),
+                        }
+                    }
+                    Err(_) => {
+                        let close = raw_frame(FrameKind::PtyClose, stream_id, Vec::new());
+                        let _ = write_frame(&mut *device_stream, &close).await;
+                        break;
+                    }
+                }
+            }
+            remote = read_frame(&mut *device_stream) => {
+                let mut remote = remote?;
+                if remote.stream_id != stream_id {
+                    bail!("unexpected remote stream {} during PTY", remote.stream_id);
+                }
+                let done = remote.kind == FrameKind::PtyExit || remote.kind == FrameKind::Error;
+                remote.stream_id = stream_id;
+                write_frame(reader.get_mut(), &remote).await?;
+                if done {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}

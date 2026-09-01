@@ -1,0 +1,12 @@
+/target/
+/target-*/
+/webui/node_modules/
+/webui/dist/
+/dist/
+/*.exe
+/*.zip
+*.log
+**/*.rs.bk
+.idea/
+.vscode/
+module/bin/sidewired

@@ -1,0 +1,4 @@
+allow ksu self process setexec
+allow ksu shell process { transition noatsecure signal }
+allow ksu shell_exec file { read open getattr execute map }
+allow shell ksu fd use

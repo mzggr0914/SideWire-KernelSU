@@ -1,0 +1,16 @@
+import fs from 'node:fs';
+const p='C:/Users/Administrator/Documents/Dev/Rust/SideWire-KernelSU/apps/sidewired/src/main.rs';
+let s=fs.readFileSync(p,'utf8');
+const must=(a,b)=>{if(!s.includes(a))throw new Error('missing block');s=s.replace(a,b)};
+must('use std::process::Stdio;','use std::{ffi::CString, fs, process::Stdio};');
+must('    #[arg(long, default_value = "sidewire-device")]\n    name: String,','    #[arg(long, default_value = "sidewire-device")]\n    name: String,\n    #[arg(long)]\n    config: Option<String>,');
+const old=`    let cli = Cli::parse();\n    match cli.mode {\n        Mode::Inbound => run_inbound(&cli.listen, &cli.name).await,\n        Mode::Outbound => run_outbound(&cli.server, &cli.name).await,\n    }`;
+const neu=`    let cli = Cli::parse();\n    let resolved = resolve_config(&cli)?;\n    tracing::info!(mode = ?resolved.mode, name = %resolved.name, "SideWire configuration loaded");\n    match resolved.mode {\n        Mode::Inbound => run_inbound(&resolved.endpoint, &resolved.name).await,\n        Mode::Outbound => run_outbound(&resolved.endpoint, &resolved.name).await,\n    }`;
+must(old,neu);
+fs.writeFileSync(p,s);
+let t=fs.readFileSync(p,'utf8');
+const marker='#[tokio::main]\nasync fn main() -> Result<()> {';
+const insert=`#[derive(Clone, Debug)]\nstruct ResolvedConfig { mode: Mode, endpoint: String, name: String }\n\nfn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {\n    if let Some(path) = &cli.config {\n        let text = fs::read_to_string(path).with_context(|| format!("read config {path}"))?;\n        let mut mode = cli.mode; let mut host = String::new(); let mut port = 58321u16; let mut name = cli.name.clone();\n        for raw in text.lines() { let line=raw.trim(); if line.is_empty() || line.starts_with('#') { continue; }\n            let Some((k,v))=line.split_once('=') else { continue; }; let v=v.trim().trim_matches('"');\n            match k.trim() { "mode" => mode=if v.eq_ignore_ascii_case("inbound"){Mode::Inbound}else{Mode::Outbound}, "host"=>host=v.into(), "port"=>port=v.parse().unwrap_or(58321), "name"=>name=v.into(), _=>{} }\n        }\n        let endpoint=match mode { Mode::Inbound=>format!("0.0.0.0:{port}"), Mode::Outbound=>format!("{}:{port}", if host.is_empty(){"127.0.0.1"}else{&host}) };\n        return Ok(ResolvedConfig { mode, endpoint, name });\n    }\n    Ok(ResolvedConfig { mode: cli.mode, endpoint: match cli.mode { Mode::Inbound=>cli.listen.clone(), Mode::Outbound=>cli.server.clone() }, name: cli.name.clone() })\n}\n\n`;
+if(!t.includes(marker))throw new Error('main marker missing');
+t=t.replace(marker,insert+marker);
+fs.writeFileSync(p,t);

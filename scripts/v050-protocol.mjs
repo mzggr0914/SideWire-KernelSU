@@ -1,0 +1,10 @@
+import fs from 'node:fs';
+const p='crates/sidewire-protocol/src/lib.rs';
+let s=fs.readFileSync(p,'utf8');
+s=s.replace('pub const VERSION: u16 = 2;','pub const VERSION: u16 = 3;');
+s=s.replace('    ProxyStartAck = 41,\n    Ping = 20,','    ProxyStartAck = 41,\n    PtyOpen = 50,\n    PtyOpenAck = 51,\n    PtyInput = 52,\n    PtyOutput = 53,\n    PtyResize = 54,\n    PtyExit = 55,\n    PtyClose = 56,\n    Ping = 20,');
+s=s.replace('            41 => Self::ProxyStartAck,\n            20 => Self::Ping,','            41 => Self::ProxyStartAck,\n            50 => Self::PtyOpen,\n            51 => Self::PtyOpenAck,\n            52 => Self::PtyInput,\n            53 => Self::PtyOutput,\n            54 => Self::PtyResize,\n            55 => Self::PtyExit,\n            56 => Self::PtyClose,\n            20 => Self::Ping,');
+const marker='#[derive(Debug, Serialize, Deserialize)]\npub struct ErrorMessage';
+const block='#[derive(Debug, Serialize, Deserialize)]\npub struct PtyOpenRequest {\n    pub program: String,\n    pub args: Vec<String>,\n    pub identity: ExecIdentity,\n    pub cols: u16,\n    pub rows: u16,\n    pub term: String,\n}\n\n#[derive(Debug, Serialize, Deserialize)]\npub struct PtyOpenAck {\n    pub pid: u32,\n}\n\n#[derive(Debug, Clone, Copy, Serialize, Deserialize)]\npub struct PtyResize {\n    pub cols: u16,\n    pub rows: u16,\n}\n\n#[derive(Debug, Serialize, Deserialize)]\npub struct PtyExit {\n    pub code: Option<i32>,\n}\n\n';
+if(!s.includes('pub struct PtyOpenRequest')) s=s.replace(marker,block+marker);
+fs.writeFileSync(p,s);

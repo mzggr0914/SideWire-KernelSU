@@ -1,0 +1,27 @@
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter("info").init();
+    match Cli::parse().command {
+        Command::Server { bind, control } => run_server(&bind, &control).await,
+        Command::Devices { control } => run_devices(&control).await,
+        Command::Exec { control, device, run_as, program, args } =>
+            run_exec_client(&control, device, run_as, program, args).await,
+        Command::Shell { control, device, run_as } => run_shell(&control, device, run_as).await,
+        Command::Push { control, device, run_as, local, remote } =>
+            run_push(&control, device, run_as, local, remote).await,
+        Command::Pull { control, device, run_as, remote, local } =>
+            run_pull(&control, device, run_as, remote, local).await,
+        Command::Install { control, device, run_as, apk } =>
+            run_install(&control, device, run_as, apk).await,
+        Command::Uninstall { control, device, run_as, package } =>
+            run_exec_checked(&control, device, run_as, "/system/bin/pm", vec!["uninstall".into(), package]).await,
+        Command::Logcat { control, device, run_as, clear, args } =>
+            run_logcat(&control, device, run_as, clear, args).await,
+        Command::Forward { control, device, local, remote } => run_forward(&control, device, local, remote).await,
+        Command::Reverse { control, device, remote, local } => run_reverse(&control, device, remote, local).await,
+        Command::Reboot { control, device, run_as, target } => run_reboot(&control, device, run_as, target).await,
+        Command::Screencap { control, device, run_as, output } => run_screencap(&control, device, run_as, output).await,
+        Command::Packages { control, device, run_as, filter } => run_packages(&control, device, run_as, filter).await,
+        Command::App { control, device, run_as, command } => run_app(&control, device, run_as, command).await,
+    }
+}

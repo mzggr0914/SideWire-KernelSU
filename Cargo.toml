@@ -1,0 +1,26 @@
+﻿[workspace]
+resolver = "2"
+members = [
+    "crates/sidewire-protocol",
+    "apps/sidewire",
+    "apps/sidewired",
+]
+
+[workspace.package]
+version = "0.5.6"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["SideWire contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+panic = "abort"

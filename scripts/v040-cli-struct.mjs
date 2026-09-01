@@ -1,0 +1,12 @@
+import fs from 'node:fs';
+let root=fs.readFileSync('Cargo.toml','utf8');
+root=root.replace('postcard = { version = "1", features = ["alloc"] }','postcard = { version = "1", features = ["alloc"] }\nrand = "0.9"');
+fs.writeFileSync('Cargo.toml',root);
+let ct=fs.readFileSync('apps/sidewire/Cargo.toml','utf8');
+ct=ct.replace('clap.workspace = true','clap.workspace = true\nrand.workspace = true');
+fs.writeFileSync('apps/sidewire/Cargo.toml',ct);
+const p='apps/sidewire/src/main.rs'; let s=fs.readFileSync(p,'utf8');
+s=s.replace('struct DeviceSession {\n    peer: String,\n    stream: Arc<Mutex<TcpStream>>,\n}','struct DeviceSession {\n    peer: String,\n    device_ip: IpAddr,\n    local_ip: IpAddr,\n    stream: Arc<Mutex<TcpStream>>,\n}');
+s=s.replace('        run_as: RunAs,\n    },\n}','        run_as: RunAs,\n    },\n    Push { device: Option<String>, local: String, remote: String },\n    Pull { device: Option<String>, remote: String, local: String },\n    Forward { device: Option<String>, local_port: u16, remote_port: u16 },\n    Reverse { device: Option<String>, device_port: u16, host_port: u16 },\n}');
+s=s.replace('    Error {\n        message: String,\n    },','    Ok { message: String },\n    Error {\n        message: String,\n    },');
+fs.writeFileSync(p,s);

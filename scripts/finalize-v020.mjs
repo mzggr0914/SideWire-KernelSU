@@ -1,0 +1,10 @@
+import fs from 'node:fs';
+const root='C:/Users/Administrator/Documents/Dev/Rust/SideWire-KernelSU';
+let cargo=fs.readFileSync(`${root}/Cargo.toml`,'utf8');
+cargo=cargo.replace('version = "0.1.0"','version = "0.2.0"');
+fs.writeFileSync(`${root}/Cargo.toml`,cargo);
+let js=fs.readFileSync(`${root}/webui/src/main.js`,'utf8');
+js=js.replace('<div><label>Default identity</label><select id="identity"><option value="root">Root</option><option value="shell">Shell (uid 2000)</option></select></div>','');
+js=js.replace("$('identity').value=await get('identity','root');",'');
+js=js.replace("['host','port','name','identity','mode','autostart']","['host','port','name','mode','autostart']");
+fs.writeFileSync(`${root}/webui/src/main.js`,js);

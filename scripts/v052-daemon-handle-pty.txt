@@ -1,0 +1,99 @@
+async fn handle_pty(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> Result<()> {
+    let request: PtyOpenRequest = decode(payload)?;
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (stream, stream_id, request);
+        bail!("PTY is only supported by the Android daemon");
+    }
+    #[cfg(target_os = "android")]
+    {
+        let (master, resize, slave_name) = open_pty(request.cols.max(1), request.rows.max(1))?;
+        let mut command = Command::new(&request.program);
+        command
+            .args(&request.args)
+            .env("TERM", &request.term)
+            .env("COLORTERM", "truecolor")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let identity = request.identity;
+        unsafe {
+            command.pre_exec(move || configure_pty_child(&slave_name, identity));
+        }
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("spawn PTY program {}", request.program))?;
+        let pid = child.id().unwrap_or(0);
+        write_frame(stream, &frame(FrameKind::PtyOpenAck, stream_id, &PtyOpenAck { pid })?).await?;
+
+        let (mut master_read, mut master_write) = tokio::io::split(master);
+        let (mut net_read, mut net_write) = tokio::io::split(stream);
+        let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+
+        let output_loop = async {
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                match master_read.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        write_frame(
+                            &mut net_write,
+                            &raw_frame(FrameKind::PtyOutput, stream_id, buffer[..n].to_vec()),
+                        ).await?;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(error) => {
+                        let _ = done_tx.send(true);
+                        return Err(error).context("read PTY master");
+                    }
+                }
+            }
+            let _ = done_tx.send(true);
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let input_loop = async {
+            loop {
+                tokio::select! {
+                    _ = done_rx.changed() => return Ok::<(), anyhow::Error>(()),
+                    incoming = read_frame(&mut net_read) => {
+                        let incoming = match incoming {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                let _ = child.start_kill();
+                                return Err(error);
+                            }
+                        };
+                        if incoming.stream_id != stream_id {
+                            let _ = child.start_kill();
+                            bail!("unexpected stream {} while PTY {stream_id} is active", incoming.stream_id);
+                        }
+                        match incoming.kind {
+                            FrameKind::PtyInput => master_write.write_all(&incoming.payload).await?,
+                            FrameKind::PtyResize => {
+                                let size: PtyResize = decode(&incoming.payload)?;
+                                set_pty_size(resize.as_raw_fd(), size.cols.max(1), size.rows.max(1))?;
+                            }
+                            FrameKind::PtyClose => {
+                                let _ = child.start_kill();
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                            kind => {
+                                let _ = child.start_kill();
+                                bail!("unexpected PTY frame {kind:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let (input_result, output_result) = tokio::join!(input_loop, output_loop);
+        input_result?;
+        output_result?;
+        let status = child.wait().await?;
+        let exit = PtyExit { code: status.code() };
+        write_frame(&mut net_write, &frame(FrameKind::PtyExit, stream_id, &exit)?).await?;
+        Ok(())
+    }
+}

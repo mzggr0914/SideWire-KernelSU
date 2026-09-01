@@ -1,0 +1,55 @@
+    let (mut local_read, mut local_write) = tokio::io::split(reader);
+    let (mut device_read, mut device_write) = tokio::io::split(&mut *device_stream);
+    let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+
+    let local_to_device = async {
+        loop {
+            tokio::select! {
+                _ = done_rx.changed() => return Ok::<(), anyhow::Error>(()),
+                local = read_frame(&mut local_read) => {
+                    match local {
+                        Ok(mut local) => {
+                            match local.kind {
+                                FrameKind::PtyInput | FrameKind::PtyResize | FrameKind::PtyClose => {
+                                    local.stream_id = stream_id;
+                                    write_frame(&mut device_write, &local).await?;
+                                    if local.kind == FrameKind::PtyClose {
+                                        return Ok::<(), anyhow::Error>(());
+                                    }
+                                }
+                                kind => bail!("unexpected local PTY frame {kind:?}"),
+                            }
+                        }
+                        Err(_) => {
+                            let close = raw_frame(FrameKind::PtyClose, stream_id, Vec::new());
+                            let _ = write_frame(&mut device_write, &close).await;
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let device_to_local = async {
+        let mut local_alive = true;
+        loop {
+            let mut remote = read_frame(&mut device_read).await?;
+            if remote.stream_id != stream_id {
+                bail!("unexpected remote stream {} during PTY", remote.stream_id);
+            }
+            let done = matches!(remote.kind, FrameKind::PtyExit | FrameKind::Error);
+            remote.stream_id = stream_id;
+            if local_alive && write_frame(&mut local_write, &remote).await.is_err() {
+                local_alive = false;
+            }
+            if done {
+                let _ = done_tx.send(true);
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    };
+
+    let (local_result, remote_result) = tokio::join!(local_to_device, device_to_local);
+    local_result?;
+    remote_result?;
+    Ok(())

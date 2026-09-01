@@ -1,0 +1,12 @@
+import fs from 'node:fs';
+const root='C:/Users/Administrator/Documents/Dev/Rust/SideWire-KernelSU';
+let c=fs.readFileSync(`${root}/apps/sidewired/Cargo.toml`,'utf8');
+if(!c.includes('libc =')) c += '\n[target.\'cfg(unix)\'.dependencies]\nlibc = "0.2"\n';
+fs.writeFileSync(`${root}/apps/sidewired/Cargo.toml`,c);
+let s=fs.readFileSync(`${root}/apps/sidewired/src/main.rs`,'utf8');
+s=s.replace('ExecExit, ExecRequest, FrameKind, HelloAck, decode, frame, raw_frame, read_frame, write_frame,', 'ExecExit, ExecIdentity, ExecRequest, FrameKind, HelloAck, decode, frame, raw_frame, read_frame, write_frame,');
+s=s.replace('        .args(&request.args)\n        .stdout(Stdio::piped())\n        .stderr(Stdio::piped());', '        .args(&request.args)\n        .stdin(Stdio::null())\n        .stdout(Stdio::piped())\n        .stderr(Stdio::piped());\n    apply_identity(&mut command, request.identity)?;');
+const marker='async fn handle_exec(stream: &mut TcpStream, stream_id: u32, payload: &[u8]) -> Result<()> {';
+const helper=`fn apply_identity(command: &mut Command, identity: ExecIdentity) -> Result<()> {\n    if matches!(identity, ExecIdentity::Root) { return Ok(()); }\n    #[cfg(unix)] {\n        unsafe {\n            command.pre_exec(|| {\n                let groups: [libc::gid_t; 1] = [2000];\n                if libc::setgroups(groups.len(), groups.as_ptr()) != 0 { return Err(std::io::Error::last_os_error()); }\n                if libc::setgid(2000) != 0 { return Err(std::io::Error::last_os_error()); }\n                if libc::setuid(2000) != 0 { return Err(std::io::Error::last_os_error()); }\n                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);\n                Ok(())\n            });\n        }\n    }\n    Ok(())\n}\n\n`;
+if(!s.includes('fn apply_identity(')) s=s.replace(marker, helper+marker);
+fs.writeFileSync(`${root}/apps/sidewired/src/main.rs`,s);

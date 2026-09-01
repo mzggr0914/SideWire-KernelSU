@@ -1,0 +1,50 @@
+#!/system/bin/sh
+MODDIR=${0%/*}/..
+DAEMON="$MODDIR/bin/sidewired"
+CONFIG="$MODDIR/config/sidewire.conf"
+PIDFILE="$MODDIR/sidewired.pid"
+LOGFILE="$MODDIR/sidewired.log"
+export KSU_MODULE=sidewire
+
+get(){ ksud module config get "$1" 2>/dev/null; }
+setv(){ ksud module config set "$1" "$2" >/dev/null; }
+write_config(){
+  mkdir -p "$MODDIR/config"
+  mode="$(get mode)"; [ -n "$mode" ] || mode=outbound
+  host="$(get host)"; [ -n "$host" ] || host=127.0.0.1
+  port="$(get port)"; [ -n "$port" ] || port=58321
+  name="$(get name)"; [ -n "$name" ] || name="$(getprop ro.product.model)"
+  { echo "mode=$mode"; echo "host=$host"; echo "port=$port"; echo "name=$name"; } > "$CONFIG"
+  chmod 0600 "$CONFIG"
+}
+start_daemon(){
+  [ -x "$DAEMON" ] || exit 1
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then exit 0; fi
+  write_config
+  "$DAEMON" --config "$CONFIG" >>"$LOGFILE" 2>&1 &
+  echo $! > "$PIDFILE"
+}
+stop_daemon(){
+  if [ -f "$PIDFILE" ]; then kill "$(cat "$PIDFILE")" 2>/dev/null; fi
+  rm -f "$PIDFILE"
+}
+status(){
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    pid="$(cat "$PIDFILE")"
+    ctx="$(cat "/proc/$pid/attr/current" 2>/dev/null)"
+    echo "running pid=$pid context=$ctx"
+  else
+    echo stopped
+  fi
+}
+case "$1" in
+  get) get "$2";;
+  set) setv "$2" "$3"; write_config;;
+  start) start_daemon;;
+  stop) stop_daemon;;
+  restart) stop_daemon; sleep 1; start_daemon;;
+  status) status;;
+  config) write_config; cat "$CONFIG";;
+  log) tail -n 120 "$LOGFILE" 2>/dev/null;;
+  *) echo "usage: sidewirectl get|set|start|stop|restart|status|config|log"; exit 2;;
+esac
