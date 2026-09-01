@@ -25,7 +25,7 @@ type StreamRoutes = Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sende
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     process::Command,
     time::{Duration, sleep},
 };
@@ -126,6 +126,13 @@ async fn run_inbound(bind: &str, name: &str) -> Result<()> {
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
+    let listen_port = listener.local_addr()?.port();
+    let discovery_name = name.to_owned();
+    tokio::spawn(async move {
+        if let Err(error) = run_discovery_responder(discovery_name, listen_port).await {
+            tracing::warn!(%error, "SideWire discovery responder stopped");
+        }
+    });
     tracing::info!(%bind, "SideWire inbound daemon listening");
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -137,6 +144,26 @@ async fn run_inbound(bind: &str, name: &str) -> Result<()> {
                 tracing::warn!(%error, "connection ended");
             }
         });
+    }
+}
+
+async fn run_discovery_responder(name: String, listen_port: u16) -> Result<()> {
+    let socket = UdpSocket::bind(("0.0.0.0", sidewire_protocol::DISCOVERY_PORT))
+        .await
+        .context("bind SideWire discovery responder")?;
+    let reply = sidewire_protocol::DiscoveryReply {
+        name,
+        port: listen_port,
+        protocol_version: sidewire_protocol::VERSION,
+    };
+    let encoded = sidewire_protocol::encode(&reply)?;
+    let mut buffer = [0u8; 256];
+    loop {
+        let (size, peer) = socket.recv_from(&mut buffer).await?;
+        if &buffer[..size] != sidewire_protocol::DISCOVERY_REQUEST {
+            continue;
+        }
+        socket.send_to(&encoded, peer).await?;
     }
 }
 

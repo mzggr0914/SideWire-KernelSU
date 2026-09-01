@@ -29,13 +29,17 @@ const DEFAULT_DEVICE_BIND: &str = "0.0.0.0:58321";
 const DEFAULT_CONTROL: &str = "127.0.0.1:58322";
 
 mod client;
+mod config;
+mod discovery;
 mod pty;
 mod server;
+mod transfer;
 mod transport;
 
 use server::{ControlRequest, ControlResponse};
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum RunAs {
     Root,
     Shell,
@@ -63,9 +67,30 @@ enum Command {
         bind: String,
         #[arg(long, default_value = DEFAULT_CONTROL)]
         control: String,
-        /// Connect to an Android daemon running in inbound mode. Repeat for multiple devices.
+        /// Connect to an Android daemon running in inbound mode.
         #[arg(long = "connect", value_name = "HOST:PORT")]
         connect: Vec<String>,
+        /// Discover one inbound SideWire device on the local network.
+        #[arg(long)]
+        discover: bool,
+    },
+    Discover {
+        #[arg(long, default_value_t = 1500)]
+        timeout_ms: u64,
+    },
+    Doctor {
+        #[arg(long, default_value = DEFAULT_CONTROL)]
+        control: String,
+    },
+    WaitForDevice {
+        #[arg(long, default_value = DEFAULT_CONTROL)]
+        control: String,
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
     Devices {
         #[arg(long, default_value = DEFAULT_CONTROL)]
@@ -76,8 +101,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "shell")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         program: String,
         args: Vec<String>,
     },
@@ -86,8 +111,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "shell")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         /// Use per-keystroke raw console input. Default is reliable line input.
         #[arg(long)]
         raw: bool,
@@ -100,8 +125,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "shell")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         local: PathBuf,
         remote: String,
     },
@@ -110,8 +135,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "shell")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         remote: String,
         local: PathBuf,
     },
@@ -120,8 +145,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "shell")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         apk: PathBuf,
     },
     Uninstall {
@@ -129,8 +154,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "shell")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         package: String,
     },
     Logcat {
@@ -138,8 +163,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "shell")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         #[arg(long)]
         clear: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -166,8 +191,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "root")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         target: Option<String>,
     },
     Screencap {
@@ -175,8 +200,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "shell")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         output: PathBuf,
     },
     Packages {
@@ -184,8 +209,8 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "shell")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         filter: Option<String>,
     },
     App {
@@ -193,11 +218,18 @@ enum Command {
         control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
-        #[arg(long = "as", value_enum, default_value = "shell")]
-        run_as: RunAs,
+        #[arg(long = "as", value_enum)]
+        run_as: Option<RunAs>,
         #[command(subcommand)]
         command: AppCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    Show,
+    Set { key: String, value: String },
+    Unset { key: String },
 }
 
 #[derive(Subcommand)]
@@ -210,12 +242,36 @@ enum AppCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let app_config = config::load()?;
+    match cli.command {
         Command::Server {
             bind,
             control,
-            connect,
-        } => server::run_server(&bind, &control, connect).await,
+            mut connect,
+            discover,
+        } => {
+            if discover && !connect.is_empty() {
+                bail!("use either --connect or --discover, not both");
+            }
+            if connect.is_empty()
+                && !discover
+                && let Some(endpoint) = app_config.connect.clone()
+            {
+                connect.push(endpoint);
+            }
+            server::run_server(&bind, &control, connect, discover).await
+        }
+        Command::Discover { timeout_ms } => discovery::run_discover(timeout_ms).await,
+        Command::Doctor { control } => client::run_doctor(&control, &app_config).await,
+        Command::WaitForDevice { control, timeout } => {
+            client::run_wait_for_device(&control, timeout).await
+        }
+        Command::Config { command } => match command {
+            ConfigCommand::Show => config::show(),
+            ConfigCommand::Set { key, value } => config::set(&key, &value),
+            ConfigCommand::Unset { key } => config::unset(&key),
+        },
         Command::Devices { control } => client::run_devices(&control).await,
         Command::Exec {
             control,
@@ -223,34 +279,78 @@ async fn main() -> Result<()> {
             run_as,
             program,
             args,
-        } => client::run_exec_client(&control, device, run_as, program, args).await,
+        } => {
+            client::run_exec_client(
+                &control,
+                device,
+                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
+                program,
+                args,
+            )
+            .await
+        }
         Command::Shell {
             control,
             device,
             run_as,
             raw,
             probe,
-        } => pty::run_shell(&control, device, run_as, raw, probe).await,
+        } => {
+            pty::run_shell(
+                &control,
+                device,
+                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
+                raw,
+                probe,
+            )
+            .await
+        }
         Command::Push {
             control,
             device,
             run_as,
             local,
             remote,
-        } => client::run_push(&control, device, run_as, local, remote).await,
+        } => {
+            transfer::run_push(
+                &control,
+                device,
+                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
+                local,
+                remote,
+            )
+            .await
+        }
         Command::Pull {
             control,
             device,
             run_as,
             remote,
             local,
-        } => client::run_pull(&control, device, run_as, remote, local).await,
+        } => {
+            transfer::run_pull(
+                &control,
+                device,
+                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
+                remote,
+                local,
+            )
+            .await
+        }
         Command::Install {
             control,
             device,
             run_as,
             apk,
-        } => client::run_install(&control, device, run_as, apk).await,
+        } => {
+            client::run_install(
+                &control,
+                device,
+                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
+                apk,
+            )
+            .await
+        }
         Command::Uninstall {
             control,
             device,
@@ -260,7 +360,7 @@ async fn main() -> Result<()> {
             client::run_exec_checked(
                 &control,
                 device,
-                run_as,
+                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
                 "/system/bin/pm",
                 vec!["uninstall".into(), package],
             )
@@ -272,7 +372,16 @@ async fn main() -> Result<()> {
             run_as,
             clear,
             args,
-        } => client::run_logcat(&control, device, run_as, clear, args).await,
+        } => {
+            client::run_logcat(
+                &control,
+                device,
+                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
+                clear,
+                args,
+            )
+            .await
+        }
         Command::Forward {
             control,
             device,
@@ -290,24 +399,56 @@ async fn main() -> Result<()> {
             device,
             run_as,
             target,
-        } => client::run_reboot(&control, device, run_as, target).await,
+        } => {
+            client::run_reboot(
+                &control,
+                device,
+                config::resolve_run_as(&app_config, run_as, RunAs::Root),
+                target,
+            )
+            .await
+        }
         Command::Screencap {
             control,
             device,
             run_as,
             output,
-        } => client::run_screencap(&control, device, run_as, output).await,
+        } => {
+            client::run_screencap(
+                &control,
+                device,
+                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
+                output,
+            )
+            .await
+        }
         Command::Packages {
             control,
             device,
             run_as,
             filter,
-        } => client::run_packages(&control, device, run_as, filter).await,
+        } => {
+            client::run_packages(
+                &control,
+                device,
+                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
+                filter,
+            )
+            .await
+        }
         Command::App {
             control,
             device,
             run_as,
             command,
-        } => client::run_app(&control, device, run_as, command).await,
+        } => {
+            client::run_app(
+                &control,
+                device,
+                config::resolve_run_as(&app_config, run_as, RunAs::Shell),
+                command,
+            )
+            .await
+        }
     }
 }

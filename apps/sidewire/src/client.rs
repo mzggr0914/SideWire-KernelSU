@@ -1,6 +1,9 @@
 use super::*;
 
-async fn request_control(control: &str, request: &ControlRequest) -> Result<ControlResponse> {
+pub(super) async fn request_control(
+    control: &str,
+    request: &ControlRequest,
+) -> Result<ControlResponse> {
     let mut stream = TcpStream::connect(control)
         .await
         .with_context(|| format!("connect to SideWire server control {control}"))?;
@@ -36,6 +39,99 @@ pub(super) async fn run_devices(control: &str) -> Result<()> {
         _ => bail!("unexpected server response"),
     }
 }
+pub(super) async fn run_wait_for_device(control: &str, timeout_secs: u64) -> Result<()> {
+    let started = tokio::time::Instant::now();
+    let timeout = (timeout_secs != 0).then(|| tokio::time::Duration::from_secs(timeout_secs));
+    loop {
+        let last_error = match request_control(control, &ControlRequest::Devices).await {
+            Ok(ControlResponse::Devices { devices }) if !devices.is_empty() => {
+                let device = &devices[0];
+                println!("{}\t{}", device.name, device.peer);
+                return Ok(());
+            }
+            Ok(ControlResponse::Devices { .. }) => "no device connected".to_owned(),
+            Ok(ControlResponse::Error { message }) => message,
+            Ok(_) => "unexpected server response".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+            bail!("timed out waiting for SideWire device: {last_error}");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    }
+}
+
+pub(super) async fn run_doctor(control: &str, app_config: &crate::config::AppConfig) -> Result<()> {
+    println!("SideWire CLI\t{}", env!("CARGO_PKG_VERSION"));
+    println!("Protocol\t{}", sidewire_protocol::VERSION);
+    println!("Control\t{control}");
+    println!("Config\t{}", crate::config::config_path()?.display());
+    println!(
+        "Configured connect\t{}",
+        app_config.connect.as_deref().unwrap_or("(none)")
+    );
+    let default_identity = match app_config.run_as {
+        Some(RunAs::Root) => "root",
+        Some(RunAs::Shell) => "shell",
+        None => "shell",
+    };
+    println!("Default identity\t{default_identity}");
+
+    let devices = match request_control(control, &ControlRequest::Devices).await? {
+        ControlResponse::Devices { devices } => devices,
+        ControlResponse::Error { message } => bail!(message),
+        _ => bail!("unexpected devices response"),
+    };
+    if devices.is_empty() {
+        bail!("local server is reachable, but no SideWire device is connected");
+    }
+    if devices.len() != 1 {
+        bail!("doctor currently expects one connected device");
+    }
+    println!("Device\t{} ({})", devices[0].name, devices[0].peer);
+
+    match request_control(control, &ControlRequest::Ping { device: None }).await? {
+        ControlResponse::Pong { latency_ms } => println!("Round trip\t{latency_ms} ms"),
+        ControlResponse::Error { message } => bail!(message),
+        _ => bail!("unexpected ping response"),
+    }
+
+    let (model, _, model_code) = exec_control(
+        control,
+        None,
+        RunAs::Shell,
+        "/system/bin/getprop",
+        vec!["ro.product.model".into()],
+    )
+    .await?;
+    let (android, _, android_code) = exec_control(
+        control,
+        None,
+        RunAs::Shell,
+        "/system/bin/getprop",
+        vec!["ro.build.version.release".into()],
+    )
+    .await?;
+    if model_code == Some(0) {
+        println!("Model\t{}", model.trim());
+    }
+    if android_code == Some(0) {
+        println!("Android\t{}", android.trim());
+    }
+
+    let (_, _, shell_code) =
+        exec_control(control, None, RunAs::Shell, "/system/bin/id", Vec::new()).await?;
+    println!(
+        "Shell identity\t{}",
+        if shell_code == Some(0) { "OK" } else { "FAIL" }
+    );
+    let root_ok = exec_control(control, None, RunAs::Root, "/system/bin/id", Vec::new())
+        .await
+        .is_ok_and(|(_, _, code)| code == Some(0));
+    println!("Root identity\t{}", if root_ok { "OK" } else { "FAIL" });
+    Ok(())
+}
+
 pub(super) async fn run_exec_client(
     control: &str,
     device: Option<String>,
@@ -109,55 +205,7 @@ fn absolute_output(path: PathBuf) -> Result<PathBuf> {
     }
 }
 
-pub(super) async fn run_push(
-    control: &str,
-    device: Option<String>,
-    run_as: RunAs,
-    local: PathBuf,
-    remote: String,
-) -> Result<()> {
-    let local = tokio::fs::canonicalize(local).await?;
-    let request = ControlRequest::Push {
-        device,
-        local: local.to_string_lossy().into_owned(),
-        remote,
-        run_as,
-    };
-    match request_control(control, &request).await? {
-        ControlResponse::Ok { message } => {
-            println!("{message}");
-            Ok(())
-        }
-        ControlResponse::Error { message } => bail!(message),
-        _ => bail!("unexpected server response"),
-    }
-}
-
-pub(super) async fn run_pull(
-    control: &str,
-    device: Option<String>,
-    run_as: RunAs,
-    remote: String,
-    local: PathBuf,
-) -> Result<()> {
-    let local = absolute_output(local)?;
-    let request = ControlRequest::Pull {
-        device,
-        remote,
-        local: local.to_string_lossy().into_owned(),
-        run_as,
-    };
-    match request_control(control, &request).await? {
-        ControlResponse::Ok { message } => {
-            println!("{message}");
-            Ok(())
-        }
-        ControlResponse::Error { message } => bail!(message),
-        _ => bail!("unexpected server response"),
-    }
-}
-
-async fn exec_control(
+pub(super) async fn exec_control(
     control: &str,
     device: Option<String>,
     run_as: RunAs,

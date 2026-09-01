@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use sidewire_protocol::{PtyCompleteRequest, PtyCompleteResult};
 #[cfg(target_os = "android")]
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -54,6 +54,32 @@ fn completion_token_start(line: &str, cursor: usize) -> usize {
         }
     }
     start
+}
+
+#[cfg(any(target_os = "android", test))]
+fn command_segment_start(line: &str, cursor: usize) -> usize {
+    let mut start = 0usize;
+    let mut quote = None;
+    for (index, character) in line[..cursor].char_indices() {
+        match quote {
+            Some(active) if character == active => quote = None,
+            Some(_) => {}
+            None if matches!(character, '\'' | '"') => quote = Some(character),
+            None if "|;&()".contains(character) => start = index + character.len_utf8(),
+            None => {}
+        }
+    }
+    start
+}
+
+#[cfg(any(target_os = "android", test))]
+fn command_context(line: &str, token_start: usize) -> (bool, Option<&str>) {
+    let segment_start = command_segment_start(line, token_start);
+    let before = line[segment_start..token_start].trim();
+    if before.is_empty() {
+        return (true, None);
+    }
+    (false, before.split_whitespace().next())
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -130,6 +156,82 @@ fn completion_entries(path: &Path) -> Result<Arc<Vec<CachedDirEntry>>> {
 }
 
 #[cfg(target_os = "android")]
+fn process_env(pid: u32, key: &str) -> Option<String> {
+    let data = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{key}=");
+    data.split(|byte| *byte == 0).find_map(|entry| {
+        let text = std::str::from_utf8(entry).ok()?;
+        text.strip_prefix(&prefix).map(str::to_owned)
+    })
+}
+
+#[cfg(target_os = "android")]
+fn finish_completion(
+    request: &PtyCompleteRequest,
+    start: usize,
+    cursor: usize,
+    typed: &str,
+    mut candidates: Vec<String>,
+) -> PtyCompleteResult {
+    candidates.sort_unstable();
+    candidates.dedup();
+    let candidate_count = candidates.len() as u32;
+    let replacement = if let Some(first) = candidates.first() {
+        let mut prefix = first.clone();
+        for candidate in &candidates[1..] {
+            shrink_common_prefix(&mut prefix, candidate);
+            if prefix.is_empty() {
+                break;
+            }
+        }
+        if candidates.len() == 1 || prefix.len() > typed.len() {
+            prefix
+        } else {
+            typed.to_owned()
+        }
+    } else {
+        typed.to_owned()
+    };
+    candidates.truncate(MAX_COMPLETION_CANDIDATES);
+    let mut line = request.line.clone();
+    line.replace_range(start..cursor, &replacement);
+    PtyCompleteResult {
+        line,
+        cursor: (start + replacement.len()) as u32,
+        candidates,
+        candidate_count,
+    }
+}
+
+#[cfg(target_os = "android")]
+fn complete_program(
+    pid: u32,
+    request: &PtyCompleteRequest,
+    start: usize,
+    cursor: usize,
+    typed: &str,
+) -> Result<PtyCompleteResult> {
+    let path = process_env(pid, "PATH").unwrap_or_else(|| {
+        "/product/bin:/apex/com.android.runtime/bin:/system_ext/bin:/system/bin:/system/xbin:/vendor/bin"
+            .into()
+    });
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for directory in path.split(':').filter(|path| !path.is_empty()) {
+        let Ok(entries) = completion_entries(Path::new(directory)) else {
+            continue;
+        };
+        for entry in entries.iter() {
+            if entry.is_dir || !entry.name.starts_with(typed) || !seen.insert(entry.name.clone()) {
+                continue;
+            }
+            candidates.push(entry.name.clone());
+        }
+    }
+    Ok(finish_completion(request, start, cursor, typed, candidates))
+}
+
+#[cfg(target_os = "android")]
 pub(super) fn complete_pty_path(
     pid: u32,
     request: &PtyCompleteRequest,
@@ -140,71 +242,55 @@ pub(super) fn complete_pty_path(
     }
     let start = completion_token_start(&request.line, cursor);
     let typed = &request.line[start..cursor];
+    let (command_position, command) = command_context(&request.line, start);
+    if command_position && !typed.contains('/') {
+        return complete_program(pid, request, start, cursor, typed);
+    }
+    if typed == "~" {
+        return Ok(finish_completion(
+            request,
+            start,
+            cursor,
+            typed,
+            vec!["~/".into()],
+        ));
+    }
+
     let split = typed.rfind('/').map(|index| index + 1).unwrap_or(0);
     let (directory_text, needle) = typed.split_at(split);
-
     let cwd = fs::read_link(format!("/proc/{pid}/cwd"))
         .with_context(|| format!("read PTY cwd for pid {pid}"))?;
-    let search_dir = if directory_text.starts_with('/') {
-        std::path::PathBuf::from(if directory_text.is_empty() {
-            "/"
-        } else {
-            directory_text
-        })
+    let search_dir = if let Some(relative) = directory_text.strip_prefix("~/") {
+        process_env(pid, "HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.clone())
+            .join(relative)
+    } else if directory_text.starts_with('/') {
+        PathBuf::from(directory_text)
     } else if directory_text.is_empty() {
         cwd
     } else {
         cwd.join(directory_text)
     };
 
-    let mut matches = 0usize;
-    let mut first = None;
-    let mut prefix = String::new();
+    let directory_only = command == Some("cd");
     let mut candidates = Vec::new();
-    let entries = completion_entries(&search_dir)?;
-    for entry in entries.iter() {
-        if !entry.name.starts_with(needle) {
+    for entry in completion_entries(&search_dir)?.iter() {
+        if !entry.name.starts_with(needle) || (directory_only && !entry.is_dir) {
             continue;
         }
         let mut candidate = format!("{directory_text}{}", entry.name);
         if entry.is_dir {
             candidate.push('/');
         }
-
-        matches += 1;
-        if matches == 1 {
-            prefix.clone_from(&candidate);
-            first = Some(candidate.clone());
-        } else {
-            shrink_common_prefix(&mut prefix, &candidate);
-        }
         candidates.push(candidate);
     }
-
-    let replacement = match matches {
-        0 => typed.to_owned(),
-        1 => first.unwrap_or_else(|| typed.to_owned()),
-        _ if prefix.len() > typed.len() => prefix,
-        _ => typed.to_owned(),
-    };
-    candidates.sort_unstable();
-    let candidate_count = candidates.len() as u32;
-    candidates.truncate(MAX_COMPLETION_CANDIDATES);
-
-    let mut line = request.line.clone();
-    line.replace_range(start..cursor, &replacement);
-    let cursor = start + replacement.len();
-    Ok(PtyCompleteResult {
-        line,
-        cursor: cursor as u32,
-        candidates,
-        candidate_count,
-    })
+    Ok(finish_completion(request, start, cursor, typed, candidates))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{common_completion_prefix, completion_token_start};
+    use super::{command_context, common_completion_prefix, completion_token_start};
 
     #[test]
     fn finds_path_token_after_shell_separator() {
@@ -222,5 +308,19 @@ mod tests {
     fn finds_common_candidate_prefix() {
         let values = vec!["class/".into(), "classes.dex".into()];
         assert_eq!(common_completion_prefix(&values), "class");
+    }
+
+    #[test]
+    fn detects_command_position_after_separator() {
+        let line = "echo ok && getpr";
+        let start = completion_token_start(line, line.len());
+        assert_eq!(command_context(line, start), (true, None));
+    }
+
+    #[test]
+    fn detects_cd_argument_context() {
+        let line = "cd /sys/cl";
+        let start = completion_token_start(line, line.len());
+        assert_eq!(command_context(line, start), (false, Some("cd")));
     }
 }

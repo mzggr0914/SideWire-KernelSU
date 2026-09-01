@@ -23,6 +23,9 @@ pub(super) struct DeviceInfo {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub(super) enum ControlRequest {
     Devices,
+    Ping {
+        device: Option<String>,
+    },
     Exec {
         device: Option<String>,
         program: String,
@@ -88,6 +91,9 @@ pub(super) enum ControlResponse {
     Devices {
         devices: Vec<DeviceInfo>,
     },
+    Pong {
+        latency_ms: u64,
+    },
     Exec {
         stdout: String,
         stderr: String,
@@ -100,14 +106,25 @@ pub(super) enum ControlResponse {
         message: String,
     },
 }
-pub(super) async fn run_server(bind: &str, control: &str, connect: Vec<String>) -> Result<()> {
+pub(super) async fn run_server(
+    bind: &str,
+    control: &str,
+    connect: Vec<String>,
+    discover: bool,
+) -> Result<()> {
     let devices: DeviceMap = Arc::new(RwLock::new(HashMap::new()));
-    tracing::info!(%bind, %control, inbound_targets = connect.len(), "SideWire server starting");
+    tracing::info!(%bind, %control, inbound_targets = connect.len(), discover, "SideWire server starting");
 
     for endpoint in connect {
         let devices = devices.clone();
         tokio::spawn(async move {
             device_connector(endpoint, devices).await;
+        });
+    }
+    if discover {
+        let devices = devices.clone();
+        tokio::spawn(async move {
+            discovered_device_connector(devices).await;
         });
     }
 
@@ -183,46 +200,62 @@ async fn connect_device(stream: &mut TcpStream) -> Result<String> {
     Ok(ack.name)
 }
 
+async fn connect_endpoint_once(endpoint: &str, devices: &DeviceMap) -> Result<()> {
+    tracing::info!(%endpoint, "connecting to inbound SideWire device");
+    let mut stream = TcpStream::connect(endpoint)
+        .await
+        .with_context(|| format!("connect inbound device {endpoint}"))?;
+    stream.set_nodelay(true).context("enable TCP_NODELAY")?;
+    let peer = stream.peer_addr()?;
+    let local = stream.local_addr()?;
+    let name = connect_device(&mut stream).await?;
+    let peer_text = peer.to_string();
+    tracing::info!(device = %name, peer = %peer_text, %endpoint, "inbound device connected");
+    let transport = DeviceTransport::new(stream);
+    let session = DeviceSession {
+        peer: peer_text,
+        device_ip: peer.ip(),
+        local_ip: local.ip(),
+        transport: transport.clone(),
+    };
+    devices.write().await.insert(name.clone(), session.clone());
+    transport.wait_closed().await;
+    remove_device_if_same(devices, &name, &session).await;
+    tracing::warn!(device = %name, %endpoint, "inbound device connection ended");
+    Ok(())
+}
+
 async fn device_connector(endpoint: String, devices: DeviceMap) {
     let mut delay = 1u64;
     loop {
-        tracing::info!(%endpoint, "connecting to inbound SideWire device");
-        match TcpStream::connect(&endpoint).await {
-            Ok(mut stream) => {
-                if let Err(error) = stream.set_nodelay(true) {
-                    tracing::warn!(%endpoint, %error, "failed to enable TCP_NODELAY");
-                }
-                let peer = stream.peer_addr();
-                let local = stream.local_addr();
-                match (peer, local, connect_device(&mut stream).await) {
-                    (Ok(peer), Ok(local), Ok(name)) => {
-                        let peer_text = peer.to_string();
-                        tracing::info!(device = %name, peer = %peer_text, %endpoint, "inbound device connected");
-                        let transport = DeviceTransport::new(stream);
-                        let session = DeviceSession {
-                            peer: peer_text,
-                            device_ip: peer.ip(),
-                            local_ip: local.ip(),
-                            transport: transport.clone(),
-                        };
-                        devices.write().await.insert(name.clone(), session.clone());
-                        delay = 1;
-                        transport.wait_closed().await;
-                        remove_device_if_same(&devices, &name, &session).await;
-                        tracing::warn!(device = %name, %endpoint, "inbound device connection ended");
-                    }
-                    (_, _, Err(error)) => {
-                        tracing::warn!(%endpoint, %error, "inbound device handshake failed");
-                    }
-                    (Err(error), _, _) | (_, Err(error), _) => {
-                        tracing::warn!(%endpoint, %error, "could not inspect inbound device socket");
-                    }
-                }
-            }
+        match connect_endpoint_once(&endpoint, &devices).await {
+            Ok(()) => delay = 1,
             Err(error) => tracing::warn!(%endpoint, %error, "inbound device connect failed"),
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
         delay = (delay * 2).min(30);
+    }
+}
+
+async fn discovered_device_connector(devices: DeviceMap) {
+    loop {
+        match crate::discovery::discover_one(tokio::time::Duration::from_millis(1500)).await {
+            Ok(Some(found)) if found.protocol_version == sidewire_protocol::VERSION => {
+                let endpoint = found.endpoint;
+                if let Err(error) = connect_endpoint_once(&endpoint, &devices).await {
+                    tracing::warn!(%endpoint, %error, "discovered device connection failed");
+                }
+            }
+            Ok(Some(found)) => tracing::warn!(
+                device = %found.name,
+                device_protocol = found.protocol_version,
+                host_protocol = sidewire_protocol::VERSION,
+                "ignoring discovered device with incompatible protocol"
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::debug!(%error, "SideWire discovery failed"),
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 }
 
@@ -459,6 +492,17 @@ async fn process_control(request: ControlRequest, devices: &DeviceMap) -> Contro
             list.sort_by(|a, b| a.name.cmp(&b.name));
             ControlResponse::Devices { devices: list }
         }
+        ControlRequest::Ping { device } => match resolve_device(devices, device.as_deref()).await {
+            Ok((_, session)) => match remote_ping(&session).await {
+                Ok(latency_ms) => ControlResponse::Pong { latency_ms },
+                Err(error) => ControlResponse::Error {
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => ControlResponse::Error {
+                message: error.to_string(),
+            },
+        },
         ControlRequest::Exec {
             device,
             program,
@@ -590,6 +634,25 @@ async fn remove_device_if_same(devices: &DeviceMap, name: &str, session: &Device
         tracing::info!(device = %name, "device disconnected");
     }
 }
+async fn remote_ping(session: &DeviceSession) -> Result<u64> {
+    let mut stream = session.transport.open_stream().await?;
+    let nonce = rand::random::<[u8; 8]>();
+    let started = std::time::Instant::now();
+    stream.send_raw(FrameKind::Ping, &nonce).await?;
+    let response = stream.recv().await?;
+    match response.kind {
+        FrameKind::Pong if response.payload.as_slice() == nonce.as_slice() => {
+            Ok(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+        }
+        FrameKind::Pong => bail!("ping nonce mismatch"),
+        FrameKind::Error => bail!(
+            "remote ping error: {}",
+            String::from_utf8_lossy(&response.payload)
+        ),
+        other => bail!("unexpected ping response {other:?}"),
+    }
+}
+
 async fn remote_exec(
     session: &DeviceSession,
     program: String,
