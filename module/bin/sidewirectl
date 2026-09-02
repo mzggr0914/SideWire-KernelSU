@@ -8,8 +8,23 @@ LOGFILE="$STATE_DIR/sidewired.log"
 PAIRING_FILE="$STATE_DIR/pairing"
 PAIRS_DIR="$STATE_DIR/paired_hosts"
 LEGACY_STATE="$MODDIR/config"
+LEGACY_PIDFILE="$MODDIR/sidewired.pid"
 CLIPBOARD_HELPER="$MODDIR/bin/sidewire-clipboard.jar"
 export KSU_MODULE=sidewire
+
+pid_is_sidewired(){
+  pid="$1"
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "sidewired" ]
+}
+cleanup_extra_daemons(){
+  keep="$1"; killed=0
+  for pid in $(pidof sidewired 2>/dev/null); do
+    [ -n "$keep" ] && [ "$pid" = "$keep" ] && continue
+    if pid_is_sidewired "$pid"; then kill "$pid" 2>/dev/null; killed=1; fi
+  done
+  [ "$killed" -eq 0 ] || sleep 1
+}
 
 ensure_state(){
   mkdir -p "$STATE_DIR" "$PAIRS_DIR"
@@ -76,7 +91,14 @@ unpair(){
 start_daemon(){
   ensure_state
   [ -x "$DAEMON" ] || exit 1
-  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then exit 0; fi
+  current=""
+  if [ -f "$PIDFILE" ]; then
+    pid="$(cat "$PIDFILE" 2>/dev/null)"
+    if pid_is_sidewired "$pid"; then current="$pid"; else rm -f "$PIDFILE"; fi
+  fi
+  cleanup_extra_daemons "$current"
+  rm -f "$LEGACY_PIDFILE"
+  [ -n "$current" ] && exit 0
   write_config
   "$DAEMON" --config "$CONFIG" >>"$LOGFILE" 2>&1 &
   echo $! > "$PIDFILE"
@@ -86,15 +108,16 @@ unpair_all(){
   rm -f "$PAIRS_DIR"/*.pair "$PAIRING_FILE"
 }
 stop_daemon(){
-  if [ -f "$PIDFILE" ]; then kill "$(cat "$PIDFILE")" 2>/dev/null; fi
-  rm -f "$PIDFILE"
+  cleanup_extra_daemons ""
+  rm -f "$PIDFILE" "$LEGACY_PIDFILE"
 }
 status(){
-  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    pid="$(cat "$PIDFILE")"
+  pid="$(cat "$PIDFILE" 2>/dev/null)"
+  if pid_is_sidewired "$pid"; then
     ctx="$(cat "/proc/$pid/attr/current" 2>/dev/null)"
     echo "running pid=$pid context=$ctx"
   else
+    rm -f "$PIDFILE"
     echo stopped
   fi
 }

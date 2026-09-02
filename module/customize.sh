@@ -1,5 +1,5 @@
 #!/system/bin/sh
-ui_print "- SideWire 0.9.2"
+ui_print "- SideWire 0.9.3"
 ui_print "- Root/shell execution + KernelSU WebUI"
 [ "$ARCH" = "arm64" ] || abort "SideWire currently supports arm64 only"
 set_perm "$MODPATH/bin/sidewired" 0 0 0755
@@ -8,6 +8,11 @@ set_perm "$MODPATH/bin/sidewire-clipboard.jar" 0 0 0644
 set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/sepolicy.rule" 0 0 0644
 export KSU_MODULE=sidewire
+for pid in $(pidof sidewired 2>/dev/null); do
+  [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "sidewired" ] && kill "$pid" 2>/dev/null
+done
+sleep 1
+rm -f /data/adb/sidewire/sidewired.pid /data/adb/modules/sidewire/sidewired.pid
 STATE_DIR="/data/adb/sidewire"
 PAIRS_DIR="$STATE_DIR/paired_hosts"
 OLD_PAIRS="/data/adb/modules/sidewire/config/paired_hosts"

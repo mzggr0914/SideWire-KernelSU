@@ -70,7 +70,10 @@ pub(super) async fn run_pair(target: Option<String>, discover: bool) -> Result<(
     let protocol = negotiated_version(banner.protocol_version)
         .context("no compatible pairing protocol version")?;
     if !banner.pairing_available {
-        bail!("pairing is not enabled on {}", banner.name);
+        bail!(
+            "pairing is not enabled on {}; generate a new PIN in the SideWire WebUI and retry within 60 seconds",
+            banner.name
+        );
     }
     println!("Device: {} [{}]", banner.name, banner.device_id.short());
     let pin = read_pin()?;

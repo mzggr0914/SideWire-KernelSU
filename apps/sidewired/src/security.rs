@@ -449,6 +449,23 @@ mod tests {
     }
 
     #[test]
+    fn active_pairing_file_is_available() {
+        let path =
+            std::env::temp_dir().join(format!("sidewire-pair-active-{}", rand::random::<u64>()));
+        let until = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        fs::write(&path, format!("pin=123456\nuntil={until}\n")).unwrap();
+        assert_eq!(
+            pairing_pin(path.to_str().unwrap()).unwrap().as_deref(),
+            Some("123456")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn expired_or_missing_pairing_file_is_inactive() {
         let path =
             std::env::temp_dir().join(format!("sidewire-pair-test-{}", rand::random::<u64>()));

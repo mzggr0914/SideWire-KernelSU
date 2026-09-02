@@ -1,6 +1,6 @@
 # SideWire
 
-ADB-independent native control bridge for rooted Android devices. SideWire 0.9.2 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
+ADB-independent native control bridge for rooted Android devices. SideWire 0.9.3 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
 
 ## Components
 
@@ -30,7 +30,7 @@ This creates:
 
 ```text
 dist/sidewire.exe
-dist/SideWire-KernelSU-v0.9.2-arm64.zip
+dist/SideWire-KernelSU-v0.9.3-arm64.zip
 ```
 
 The packager verifies required module entries and rejects Windows-style `\` separators inside the ZIP so KernelSU can detect `webroot/index.html` correctly.
@@ -53,7 +53,7 @@ powershell -File .\scripts\build-linux.ps1
 powershell -File .\scripts\release-linux.ps1
 ```
 
-The Linux release is written as `dist/sidewire-v0.9.2-linux-<arch>`. To build every platform from Windows, use `powershell -File .\scripts\build-all.ps1` or `powershell -File .\scripts\release-all.ps1`. Add `-SetupLinux` on the first run.
+The Linux release is written as `dist/sidewire-v0.9.3-linux-<arch>`. To build every platform from Windows, use `powershell -File .\scripts\build-all.ps1` or `powershell -File .\scripts\release-all.ps1`. Add `-SetupLinux` on the first run.
 
 ## Desktop convenience config
 

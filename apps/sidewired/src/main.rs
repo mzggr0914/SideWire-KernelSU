@@ -175,49 +175,48 @@ async fn main() -> Result<()> {
         security = resolved.security.as_str(),
         "SideWire configuration loaded"
     );
-    if let (Some(pairing_file), Some(pairs_dir)) =
-        (resolved.pairing_file.clone(), resolved.pairs_dir.clone())
-    {
-        let name = resolved.name.clone();
-        let device_id = resolved.device_id;
-        let pairing_port = resolved.pairing_port;
-        tokio::spawn(async move {
-            if let Err(error) = security::run_pairing_listener(
-                pairing_port,
-                name,
-                device_id,
-                pairing_file,
-                pairs_dir,
-            )
-            .await
-            {
-                tracing::warn!(%error, "SideWire pairing listener stopped");
+    let pairing = match (resolved.pairing_file.clone(), resolved.pairs_dir.clone()) {
+        (Some(pairing_file), Some(pairs_dir)) => Some(security::run_pairing_listener(
+            resolved.pairing_port,
+            resolved.name.clone(),
+            resolved.device_id,
+            pairing_file,
+            pairs_dir,
+        )),
+        _ => None,
+    };
+    let device = async {
+        match resolved.mode {
+            Mode::Inbound => {
+                run_inbound(
+                    &resolved.endpoint,
+                    &resolved.name,
+                    resolved.device_id,
+                    resolved.security,
+                    resolved.pairs_dir.clone(),
+                    resolved.clipboard_helper.clone(),
+                )
+                .await
             }
-        });
-    }
-    match resolved.mode {
-        Mode::Inbound => {
-            run_inbound(
-                &resolved.endpoint,
-                &resolved.name,
-                resolved.device_id,
-                resolved.security,
-                resolved.pairs_dir.clone(),
-                resolved.clipboard_helper.clone(),
-            )
-            .await
+            Mode::Outbound => {
+                run_outbound(
+                    &resolved.endpoint,
+                    &resolved.name,
+                    resolved.device_id,
+                    resolved.security,
+                    resolved.pairs_dir.clone(),
+                    resolved.clipboard_helper.clone(),
+                )
+                .await
+            }
         }
-        Mode::Outbound => {
-            run_outbound(
-                &resolved.endpoint,
-                &resolved.name,
-                resolved.device_id,
-                resolved.security,
-                resolved.pairs_dir.clone(),
-                resolved.clipboard_helper.clone(),
-            )
-            .await
-        }
+    };
+    match pairing {
+        Some(pairing) => tokio::select! {
+            result = pairing => result,
+            result = device => result,
+        },
+        None => device.await,
     }
 }
 
