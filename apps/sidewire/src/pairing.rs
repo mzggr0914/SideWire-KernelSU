@@ -125,6 +125,9 @@ pub(super) async fn run_pair(target: Option<String>, discover: bool) -> Result<(
         complete.device_name,
         complete.device_id.short()
     );
+    println!(
+        "For outbound mode, start `sidewire server` whenever you want the device to connect; it does not need to be running during pairing."
+    );
     Ok(())
 }
 

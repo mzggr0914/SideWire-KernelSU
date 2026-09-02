@@ -60,8 +60,13 @@ write_config(){
 }
 pair(){
   ensure_state
-  raw="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')"
-  [ -n "$raw" ] || raw="$(date +%s)"
+  bytes="$(od -An -N3 -tu1 /dev/urandom 2>/dev/null)"
+  set -- $bytes
+  if [ "$#" -eq 3 ]; then
+    raw=$(($1 * 65536 + $2 * 256 + $3))
+  else
+    raw=$(date +%s)
+  fi
   pin="$(printf '%06d' $((raw % 1000000)))"
   now="$(date +%s)"
   { echo "pin=$pin"; echo "until=$((now + 60))"; } > "$PAIRING_FILE"

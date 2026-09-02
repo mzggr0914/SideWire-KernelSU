@@ -30,6 +30,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     process::Command,
+    sync::Notify,
     time::{Duration, sleep},
 };
 
@@ -175,6 +176,7 @@ async fn main() -> Result<()> {
         security = resolved.security.as_str(),
         "SideWire configuration loaded"
     );
+    let reconnect = Arc::new(Notify::new());
     let pairing = match (resolved.pairing_file.clone(), resolved.pairs_dir.clone()) {
         (Some(pairing_file), Some(pairs_dir)) => Some(security::run_pairing_listener(
             resolved.pairing_port,
@@ -182,6 +184,7 @@ async fn main() -> Result<()> {
             resolved.device_id,
             pairing_file,
             pairs_dir,
+            Some(reconnect.clone()),
         )),
         _ => None,
     };
@@ -206,6 +209,7 @@ async fn main() -> Result<()> {
                     resolved.security,
                     resolved.pairs_dir.clone(),
                     resolved.clipboard_helper.clone(),
+                    reconnect.clone(),
                 )
                 .await
             }
@@ -300,8 +304,10 @@ async fn run_outbound(
     security: SecurityMode,
     pairs_dir: Option<String>,
     clipboard_helper: Option<String>,
+    reconnect: Arc<Notify>,
 ) -> Result<()> {
     let mut delay = 1u64;
+    let mut pairing_grace = 0u8;
     loop {
         match TcpStream::connect(server).await {
             Ok(stream) => {
@@ -324,8 +330,21 @@ async fn run_outbound(
             }
             Err(error) => tracing::warn!(%server, %error, "outbound connect failed"),
         }
-        sleep(Duration::from_secs(delay)).await;
-        delay = (delay * 2).min(30);
+        tokio::select! {
+            _ = sleep(Duration::from_secs(delay)) => {
+                if pairing_grace > 0 {
+                    pairing_grace -= 1;
+                    delay = 1;
+                } else {
+                    delay = (delay * 2).min(30);
+                }
+            }
+            _ = reconnect.notified() => {
+                tracing::info!(%server, "pairing completed; enabling rapid outbound reconnects");
+                pairing_grace = 60;
+                delay = 1;
+            }
+        }
     }
 }
 

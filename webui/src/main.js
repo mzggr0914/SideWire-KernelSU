@@ -17,7 +17,7 @@ app.innerHTML=`
 <section class="card"><div class="actions"><button id="start">Start</button><button id="restart">Restart</button><button class="danger" id="stop">Stop</button></div><p class="muted" id="status"></p></section>
 `;
 app.insertAdjacentHTML('beforeend',`
-<section class="card"><div class="card-title"><div><h3>Pairing</h3><div class="muted">Secure mode uses a one-time 6-digit PIN. Paired PCs reconnect automatically.</div></div><div class="actions"><button class="small" id="refreshPaired">Refresh</button><button class="small danger" id="removeAllPaired">Remove all</button></div></div>
+<section class="card"><div class="card-title"><div><h3>Pairing</h3><div class="muted">Secure mode uses a one-time 6-digit PIN. The desktop server is not required during pairing; paired PCs reconnect automatically.</div></div><div class="actions"><button class="small" id="refreshPaired">Refresh</button><button class="small danger" id="removeAllPaired">Remove all</button></div></div>
 <div id="pinBox" class="pin-box hidden"><div class="muted">Pairing PIN</div><div class="pin" id="pin">------</div><div class="muted" id="pinTimer"></div></div>
 <p><button class="primary" id="pair">Generate pairing PIN</button></p><div id="paired"></div></section>
 <section class="card"><h3>Log</h3><pre id="log">Loading…</pre><button id="refresh">Refresh</button></section>
@@ -31,7 +31,7 @@ async function sh(cmd){const r=await exec(cmd);if(r.errno!==0)throw new Error(r.
 async function get(k,f=''){try{return await sh(`${ctl} get ${k}`)||f}catch{return f}}
 function renderSecurity(){const insecure=$('security').value==='insecure';$('insecureWarning').classList.toggle('hidden',!insecure);}
 function stripAnsi(text){return text.replace(/\x1B\[[0-?]*[ -\/]*[@-~]/g,'');}
-async function refresh(){const st=await sh(`${ctl} status`).catch(e=>`error: ${e.message}`);$('status').textContent=st;$('state').textContent=st.startsWith('running')?'running':'stopped';const log=stripAnsi(await sh(`${ctl} log`).catch(e=>e.message));$('log').textContent=log||'No log yet.';}
+async function refresh(){const st=await sh(`${ctl} status`).catch(e=>`error: ${e.message}`);$('status').textContent=st;$('state').textContent=st.startsWith('running')?'running':'stopped';const log=stripAnsi(await sh(`${ctl} log`).catch(e=>e.message));const view=$('log');view.textContent=log||'No log yet.';requestAnimationFrame(()=>{view.scrollTop=view.scrollHeight;});}
 async function refreshPaired(){
   const text=await sh(`${ctl} paired`).catch(()=>"");
   const rows=text?text.split('\n').filter(Boolean):[];
@@ -63,8 +63,8 @@ $('save').onclick=()=>saveConfig(false);$('security').onchange=renderSecurity;
 $('cancelInsecure').onclick=()=>{$('security').value=loadedSecurity;$('insecureModal').classList.add('hidden');renderSecurity()};
 $('confirmInsecure').onclick=()=>{$('insecureModal').classList.add('hidden');saveConfig(true)};
 $('pair').onclick=async()=>{try{
-  const st=$('status').textContent;if(!st.startsWith('running'))throw new Error('Start SideWire before pairing.');
-  const pin=await sh(`${ctl} pair`);$('pin').textContent=`${pin.slice(0,3)} ${pin.slice(3)}`;$('pinBox').classList.remove('hidden');
+  const st=$('status').textContent;if(!st.startsWith('running'))throw new Error('Start the Android SideWire daemon before pairing.');
+  const pin=await sh(`${ctl} pair`);if(!/^\d{6}$/.test(pin))throw new Error(`Invalid pairing PIN: ${pin}`);$('pin').textContent=`${pin.slice(0,3)} ${pin.slice(3)}`;$('pinBox').classList.remove('hidden');
   let left=60;$('pinTimer').textContent=`Expires in ${left}s`;clearInterval(pinTimer);pinTimer=setInterval(()=>{left--;if(left<=0){clearInterval(pinTimer);$('pinBox').classList.add('hidden')}else $('pinTimer').textContent=`Expires in ${left}s`;},1000);
   toast('Pairing enabled for 60 seconds');
 }catch(e){toast(e.message)}};

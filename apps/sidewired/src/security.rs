@@ -17,7 +17,7 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Notify, Semaphore},
     time::{Duration, sleep, timeout},
 };
 
@@ -368,6 +368,7 @@ pub(super) async fn run_pairing_listener(
     device_id: DeviceId,
     pairing_file: String,
     pairs_dir: String,
+    reconnect: Option<Arc<Notify>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port))
         .await
@@ -393,6 +394,7 @@ pub(super) async fn run_pairing_listener(
         let pairs_dir = pairs_dir.clone();
         let guard = guard.clone();
         let commit_lock = commit_lock.clone();
+        let reconnect = reconnect.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let result = timeout(
@@ -408,7 +410,12 @@ pub(super) async fn run_pairing_listener(
             )
             .await;
             match result {
-                Ok(Ok(())) => guard.lock().await.clear_success(),
+                Ok(Ok(())) => {
+                    guard.lock().await.clear_success();
+                    if let Some(reconnect) = reconnect {
+                        reconnect.notify_waiters();
+                    }
+                }
                 Ok(Err(error)) => {
                     tracing::warn!(%peer, %error, "pairing attempt failed");
                     if record_pair_failure(&pairing_file, &guard)

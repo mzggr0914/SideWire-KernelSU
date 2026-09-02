@@ -1,6 +1,6 @@
 # SideWire
 
-ADB-independent native control bridge for rooted Android devices. SideWire 0.9.3 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
+ADB-independent native control bridge for rooted Android devices. SideWire 0.9.4 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
 
 ## Components
 
@@ -30,7 +30,7 @@ This creates:
 
 ```text
 dist/sidewire.exe
-dist/SideWire-KernelSU-v0.9.3-arm64.zip
+dist/SideWire-KernelSU-v0.9.4-arm64.zip
 ```
 
 The packager verifies required module entries and rejects Windows-style `\` separators inside the ZIP so KernelSU can detect `webroot/index.html` correctly.
@@ -53,7 +53,7 @@ powershell -File .\scripts\build-linux.ps1
 powershell -File .\scripts\release-linux.ps1
 ```
 
-The Linux release is written as `dist/sidewire-v0.9.3-linux-<arch>`. To build every platform from Windows, use `powershell -File .\scripts\build-all.ps1` or `powershell -File .\scripts\release-all.ps1`. Add `-SetupLinux` on the first run.
+The Linux release is written as `dist/sidewire-v0.9.4-linux-<arch>`. To build every platform from Windows, use `powershell -File .\scripts\build-all.ps1` or `powershell -File .\scripts\release-all.ps1`. Add `-SetupLinux` on the first run.
 
 ## Desktop convenience config
 
@@ -75,7 +75,7 @@ The desktop CLI no longer exposes a localhost TCP control port. On Windows it ta
 
 ## Security and pairing
 
-SideWire 0.9.2 uses authenticated, encrypted connections by default. Pair each PC once from the Android WebUI: start SideWire, press **Generate pairing PIN**, then enter the six-digit PIN on the PC.
+SideWire 0.9.4 uses authenticated, encrypted connections by default. Pair each PC once from the Android WebUI: start SideWire, press **Generate pairing PIN**, then enter the six-digit PIN on the PC.
 
 ```powershell
 .\dist\sidewire.exe pair 192.168.0.123
@@ -83,6 +83,8 @@ SideWire 0.9.2 uses authenticated, encrypted connections by default. Pair each P
 .\dist\sidewire.exe pair --discover
 .\dist\sidewire.exe paired
 ```
+
+The desktop server does not need to be running while pairing. In outbound mode, a successful pairing wakes the device reconnect loop and enables one-second reconnect attempts for 60 seconds, so starting `sidewire server` immediately afterward connects without waiting for the normal backoff.
 
 The PIN is valid for 60 seconds and is only used for SPAKE2 pairing. A successful pairing exchanges a random 256-bit long-term secret; later connections authenticate and encrypt automatically without asking for the PIN again. Pairing accepts at most four concurrent handshakes, rate-limits each source IP to five attempts per minute, and disables the current PIN after five failed attempts. A PIN is single-use: once one pairing commits successfully, concurrent attempts using the same PIN cannot also commit.
 
