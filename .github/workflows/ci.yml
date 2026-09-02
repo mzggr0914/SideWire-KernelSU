@@ -43,6 +43,27 @@ jobs:
         run: pnpm build
         working-directory: webui
 
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+      - run: cargo clippy -p sidewire -p sidewire-protocol --all-targets -- -D warnings
+      - run: cargo test -p sidewire -p sidewire-protocol
+      - run: bash ./scripts/build-macos.sh
+
   android:
     name: Android arm64
     runs-on: ubuntu-latest

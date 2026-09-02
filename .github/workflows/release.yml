@@ -81,9 +81,38 @@ jobs:
           if-no-files-found: error
           path: dist/sidewire-v*-linux-x86_64
 
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Verify release version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          test "$version" = "$cargo_version" || { echo "tag/version mismatch"; exit 1; }
+      - name: Build release
+        run: bash ./scripts/release-macos.sh
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-macos-${{ matrix.arch }}
+          if-no-files-found: error
+          path: dist/sidewire-v*-macos-${{ matrix.arch }}
+
   publish:
     name: Publish GitHub Release
-    needs: [windows-android, linux]
+    needs: [windows-android, linux, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -108,5 +137,7 @@ jobs:
           files: |
             dist/sidewire-v*-windows-x86_64.exe
             dist/sidewire-v*-linux-x86_64
+            dist/sidewire-v*-macos-arm64
+            dist/sidewire-v*-macos-x86_64
             dist/SideWire-KernelSU-v*-arm64.zip
             dist/SHA256SUMS

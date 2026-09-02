@@ -1,6 +1,6 @@
 # SideWire
 
-SideWire is a native bridge for controlling rooted Android devices from Windows or Linux without relying on ADB for the actual session.
+SideWire is a native bridge for controlling rooted Android devices from Windows, macOS or Linux without relying on ADB for the actual session.
 
 It combines a small Rust daemon packaged as a KernelSU module with a Rust desktop CLI/server. Secure pairing is the default, and normal traffic is authenticated and encrypted.
 
@@ -21,7 +21,7 @@ SideWire is still pre-1.0. The current focus is reliability and real-device test
 
 - arm64 Android device
 - KernelSU-compatible module environment
-- Windows x86_64 or Linux x86_64 host
+- Windows x86_64, macOS (Apple Silicon or Intel), or Linux x86_64 host
 - both devices reachable over the same LAN/VPN
 
 Release binaries and the KernelSU ZIP are published from the GitHub Releases page.
@@ -90,6 +90,12 @@ Windows + WebUI + Android:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
+```
+
+macOS host CLI:
+
+```bash
+bash ./scripts/build-macos.sh
 ```
 
 Linux host CLI:

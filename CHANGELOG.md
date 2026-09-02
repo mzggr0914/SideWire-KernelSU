@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- added native macOS host builds for Apple Silicon and Intel
+
 ## 0.9.4
 
 - made pairing independent of the desktop server lifecycle
