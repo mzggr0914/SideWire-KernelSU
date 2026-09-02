@@ -10,6 +10,8 @@ use std::collections::HashSet;
 
 const FILE_BUFFER_SIZE: usize = 256 * 1024;
 const PROXY_BUFFER_SIZE: usize = 64 * 1024;
+const HEARTBEAT_INTERVAL_SECS: u64 = 10;
+const HEARTBEAT_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Clone, Copy, Debug)]
 enum ConnectionMode {
@@ -510,12 +512,42 @@ async fn register_device(devices: &DeviceMap, session: DeviceSession) -> Result<
         bail!(message);
     }
     tracing::info!(device = %name, device_id = %id.short(), mode = mode.as_str(), %peer, "device connected");
+    if monitor.capabilities & sidewire_protocol::capabilities::HEARTBEAT != 0 {
+        tokio::spawn(device_heartbeat(monitor.clone()));
+    }
     let devices = devices.clone();
     tokio::spawn(async move {
         monitor.transport.wait_closed().await;
         remove_device_if_same(&devices, id, &monitor).await;
     });
     Ok(())
+}
+
+async fn device_heartbeat(session: DeviceSession) {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
+        if session.transport.is_closed() {
+            return;
+        }
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS),
+            remote_ping(&session),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(device = %session.name, device_id = %session.id.short(), %error, "device heartbeat failed");
+                session.transport.close().await;
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(device = %session.name, device_id = %session.id.short(), "device heartbeat timed out");
+                session.transport.close().await;
+                return;
+            }
+        }
+    }
 }
 
 async fn connect_endpoint_once(
@@ -663,7 +695,11 @@ async fn control_listener(control: &str, devices: DeviceMap) -> Result<()> {
                 else { anyhow::anyhow!("create control pipe {control}: {error}") }
             })?;
         first = false;
-        server.connect().await?;
+        if let Err(error) = server.connect().await {
+            tracing::warn!(%control, %error, "local control pipe connect failed; retrying");
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            continue;
+        }
         tracing::info!(%control, "local CLI control connected");
         let devices = devices.clone();
         tokio::spawn(async move {

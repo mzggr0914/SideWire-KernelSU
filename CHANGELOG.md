@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.9.5
+
+- added negotiated connection heartbeats and faster outbound reconnects
+- fixed Android shell identity execution under KernelSU
+- fixed clipboard get/set/clear on Samsung Android 13 and provisioned the helper for shell access
+- made Windows local control Named Pipe startup more resilient to transient disconnects
 - relicensed SideWire under GNU GPL v3 (`GPL-3.0-only`)
 - added native macOS host builds for Apple Silicon and Intel
 

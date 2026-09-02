@@ -5,57 +5,98 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 
 public final class ClipboardHelper {
+    private static final String SHELL_PACKAGE = "com.android.shell";
+
     private ClipboardHelper() {}
 
-    private static Object shellContext() throws Exception {
-        Class<?> activityThread = Class.forName("android.app.ActivityThread");
-        Method systemMain = activityThread.getDeclaredMethod("systemMain");
-        systemMain.setAccessible(true);
-        Object thread = systemMain.invoke(null);
-        Method getSystemContext = activityThread.getDeclaredMethod("getSystemContext");
-        getSystemContext.setAccessible(true);
-        Object systemContext = getSystemContext.invoke(thread);
-        Class<?> context = Class.forName("android.content.Context");
-        Method createPackageContext = context.getMethod("createPackageContext", String.class, int.class);
-        return createPackageContext.invoke(systemContext, "com.android.shell", 0);
+    private static Object clipboardService() throws Exception {
+        Class<?> serviceManager = Class.forName("android.os.ServiceManager");
+        Object binder = serviceManager.getMethod("getService", String.class)
+                .invoke(null, "clipboard");
+        if (binder == null) throw new IllegalStateException("clipboard service is unavailable");
+        Class<?> iBinder = Class.forName("android.os.IBinder");
+        Class<?> stub = Class.forName("android.content.IClipboard$Stub");
+        Method asInterface = stub.getDeclaredMethod("asInterface", iBinder);
+        asInterface.setAccessible(true);
+        return asInterface.invoke(null, binder);
     }
 
-    private static Object clipboard(Object context) throws Exception {
-        Class<?> contextClass = Class.forName("android.content.Context");
-        Method getSystemService = contextClass.getMethod("getSystemService", String.class);
-        return getSystemService.invoke(context, "clipboard");
+    private static int currentUserId() {
+        try {
+            Class<?> activityManager = Class.forName("android.app.ActivityManager");
+            Method getCurrentUser = activityManager.getDeclaredMethod("getCurrentUser");
+            getCurrentUser.setAccessible(true);
+            return (Integer) getCurrentUser.invoke(null);
+        } catch (Throwable ignored) {
+            return 0;
+        }
     }
-    private static String getText(Object context, Object clipboard) throws Exception {
-        Class<?> manager = Class.forName("android.content.ClipboardManager");
-        Object clip = manager.getMethod("getPrimaryClip").invoke(clipboard);
+    private static Method clipboardMethod(String name) throws Exception {
+        Class<?> clipboard = Class.forName("android.content.IClipboard");
+        for (Method method : clipboard.getMethods()) {
+            if (method.getName().equals(name)) {
+                method.setAccessible(true);
+                return method;
+            }
+        }
+        throw new NoSuchMethodException("IClipboard." + name);
+    }
+
+    private static Object[] argumentsFor(Method method, Object clip) throws Exception {
+        Class<?>[] types = method.getParameterTypes();
+        Object[] args = new Object[types.length];
+        boolean packageSet = false;
+        boolean clipSet = false;
+        int intIndex = 0;
+        for (int i = 0; i < types.length; i++) {
+            String name = types[i].getName();
+            if (name.equals("android.content.ClipData")) {
+                args[i] = clip;
+                clipSet = true;
+            } else if (types[i] == String.class) {
+                args[i] = packageSet ? null : SHELL_PACKAGE;
+                packageSet = true;
+            } else if (types[i] == int.class) {
+                args[i] = intIndex++ == 0 ? currentUserId() : 0;
+            } else {
+                throw new IllegalStateException("unsupported IClipboard argument: " + name);
+            }
+        }
+        if (clip != null && !clipSet) throw new IllegalStateException("ClipData argument missing");
+        return args;
+    }
+    private static Object newPlainText(String text) throws Exception {
+        Class<?> clipData = Class.forName("android.content.ClipData");
+        return clipData.getMethod("newPlainText", CharSequence.class, CharSequence.class)
+                .invoke(null, "SideWire", text);
+    }
+
+    private static String getText(Object service) throws Exception {
+        Method getPrimaryClip = clipboardMethod("getPrimaryClip");
+        Object clip = getPrimaryClip.invoke(service, argumentsFor(getPrimaryClip, null));
         if (clip == null) return "";
         Class<?> clipData = Class.forName("android.content.ClipData");
         int count = (Integer) clipData.getMethod("getItemCount").invoke(clip);
         if (count == 0) return "";
         Object item = clipData.getMethod("getItemAt", int.class).invoke(clip, 0);
-        Class<?> itemClass = Class.forName("android.content.ClipData$Item");
-        Class<?> contextClass = Class.forName("android.content.Context");
-        Object text = itemClass.getMethod("coerceToText", contextClass).invoke(item, context);
+        Object text = item.getClass().getMethod("getText").invoke(item);
         return text == null ? "" : text.toString();
     }
 
-    private static void setText(Object clipboard, String text) throws Exception {
-        Class<?> clipData = Class.forName("android.content.ClipData");
-        Object clip = clipData.getMethod("newPlainText", CharSequence.class, CharSequence.class)
-                .invoke(null, "SideWire", text);
-        Class<?> manager = Class.forName("android.content.ClipboardManager");
-        manager.getMethod("setPrimaryClip", clipData).invoke(clipboard, clip);
+    private static void setText(Object service, String text) throws Exception {
+        Object clip = newPlainText(text);
+        Method setPrimaryClip = clipboardMethod("setPrimaryClip");
+        setPrimaryClip.invoke(service, argumentsFor(setPrimaryClip, clip));
     }
 
-    private static void clear(Object clipboard) throws Exception {
-        Class<?> manager = Class.forName("android.content.ClipboardManager");
+    private static void clear(Object service) throws Exception {
         try {
-            manager.getMethod("clearPrimaryClip").invoke(clipboard);
+            Method clearPrimaryClip = clipboardMethod("clearPrimaryClip");
+            clearPrimaryClip.invoke(service, argumentsFor(clearPrimaryClip, null));
         } catch (NoSuchMethodException ignored) {
-            setText(clipboard, "");
+            setText(service, "");
         }
     }
-
     private static String readStdin() throws Exception {
         InputStreamReader reader = new InputStreamReader(System.in, StandardCharsets.UTF_8);
         StringBuilder text = new StringBuilder();
@@ -68,17 +109,16 @@ public final class ClipboardHelper {
     public static void main(String[] args) {
         try {
             if (args.length < 1) throw new IllegalArgumentException("usage: get|set|clear");
-            Object context = shellContext();
-            Object clipboard = clipboard(context);
+            Object service = clipboardService();
             switch (args[0]) {
                 case "get":
-                    System.out.print(getText(context, clipboard));
+                    System.out.print(getText(service));
                     break;
                 case "set":
-                    setText(clipboard, readStdin());
+                    setText(service, readStdin());
                     break;
                 case "clear":
-                    clear(clipboard);
+                    clear(service);
                     break;
                 default:
                     throw new IllegalArgumentException("unknown clipboard operation: " + args[0]);

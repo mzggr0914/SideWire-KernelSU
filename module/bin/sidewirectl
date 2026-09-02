@@ -9,7 +9,9 @@ PAIRING_FILE="$STATE_DIR/pairing"
 PAIRS_DIR="$STATE_DIR/paired_hosts"
 LEGACY_STATE="$MODDIR/config"
 LEGACY_PIDFILE="$MODDIR/sidewired.pid"
-CLIPBOARD_HELPER="$MODDIR/bin/sidewire-clipboard.jar"
+CLIPBOARD_SOURCE="$MODDIR/bin/sidewire-clipboard.jar"
+SHELL_STATE_DIR="/data/local/tmp/sidewire"
+CLIPBOARD_HELPER="$SHELL_STATE_DIR/sidewire-clipboard.jar"
 export KSU_MODULE=sidewire
 
 pid_is_sidewired(){
@@ -38,11 +40,26 @@ ensure_state(){
   fi
   chmod 0600 "$PAIRS_DIR"/*.pair 2>/dev/null
 }
+provision_clipboard_helper(){
+  mkdir -p "$SHELL_STATE_DIR" || return 1
+  chown 0:2000 "$SHELL_STATE_DIR" 2>/dev/null
+  chmod 0750 "$SHELL_STATE_DIR" 2>/dev/null
+  chcon u:object_r:shell_data_file:s0 "$SHELL_STATE_DIR" 2>/dev/null || true
+  if [ -f "$CLIPBOARD_SOURCE" ]; then
+    cp "$CLIPBOARD_SOURCE" "$CLIPBOARD_HELPER" || return 1
+    chown 0:2000 "$CLIPBOARD_HELPER" 2>/dev/null
+    chmod 0440 "$CLIPBOARD_HELPER" 2>/dev/null
+    chcon u:object_r:shell_data_file:s0 "$CLIPBOARD_HELPER" 2>/dev/null || true
+  else
+    rm -f "$CLIPBOARD_HELPER"
+  fi
+}
 
 get(){ ksud module config get "$1" 2>/dev/null; }
 setv(){ ksud module config set "$1" "$2" >/dev/null; }
 write_config(){
   ensure_state
+  provision_clipboard_helper || true
   mode="$(get mode)"; [ -n "$mode" ] || mode=outbound
   host="$(get host)"; [ -n "$host" ] || host=127.0.0.1
   port="$(get port)"; [ -n "$port" ] || port=58321

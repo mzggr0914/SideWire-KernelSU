@@ -336,7 +336,7 @@ async fn run_outbound(
                     pairing_grace -= 1;
                     delay = 1;
                 } else {
-                    delay = (delay * 2).min(30);
+                    delay = (delay * 2).min(5);
                 }
             }
             _ = reconnect.notified() => {
@@ -368,7 +368,8 @@ async fn unregister_stream(routes: &StreamRoutes, stream_id: u32) {
 fn daemon_capabilities(clipboard_helper: Option<&str>) -> u64 {
     let mut capabilities = sidewire_protocol::capabilities::CORE
         | sidewire_protocol::capabilities::PTY_COMPLETION
-        | sidewire_protocol::capabilities::SECURE_PROXY;
+        | sidewire_protocol::capabilities::SECURE_PROXY
+        | sidewire_protocol::capabilities::HEARTBEAT;
     if clipboard_helper.is_some_and(|path| std::path::Path::new(path).is_file()) {
         capabilities |= sidewire_protocol::capabilities::CLIPBOARD;
     }
@@ -394,7 +395,7 @@ async fn serve(
     };
     let noise = secured.noise.clone();
     let shared_secret = secured.shared_secret;
-    if inbound {
+    let peer_capabilities = if inbound {
         let hello_frame = {
             let mut reader = SecureFrameReader::new(&mut stream, noise.clone());
             reader.read_frame().await?
@@ -418,6 +419,7 @@ async fn serve(
             local_capabilities,
         )
         .await?;
+        hello.capabilities
     } else {
         let hello = sidewire_protocol::Hello {
             device_id: Some(device_id),
@@ -446,7 +448,9 @@ async fn serve(
         if ack.capabilities & sidewire_protocol::capabilities::CORE == 0 {
             bail!("host does not advertise the core capability");
         }
-    }
+        ack.capabilities
+    };
+    let negotiated_capabilities = local_capabilities & peer_capabilities;
 
     let (reader_half, writer_half) = stream.into_split();
     let mut reader = SecureFrameReader::new(reader_half, noise.clone());
@@ -457,9 +461,17 @@ async fn serve(
         tokio::task::JoinHandle<()>,
     >::new()));
 
+    let heartbeat = negotiated_capabilities & sidewire_protocol::capabilities::HEARTBEAT != 0;
     let result: Result<()> = async {
         loop {
-            let request = reader.read_frame().await?;
+            let request = if heartbeat {
+                match tokio::time::timeout(Duration::from_secs(30), reader.read_frame()).await {
+                    Ok(result) => result?,
+                    Err(_) => bail!("host heartbeat timeout"),
+                }
+            } else {
+                reader.read_frame().await?
+            };
             let routed = { routes.lock().await.get(&request.stream_id).cloned() };
             if let Some(sender) = routed {
                 let stream_id = request.stream_id;
@@ -655,11 +667,13 @@ async fn run_clipboard_helper(
     if !std::path::Path::new(helper).is_file() {
         bail!("clipboard helper not found at {helper}");
     }
-    let mut command = Command::new("/system/bin/app_process");
+    let args = vec![
+        "/system/bin".to_owned(),
+        "com.sidewire.ClipboardHelper".to_owned(),
+        operation.to_owned(),
+    ];
+    let mut command = command_for_identity("/system/bin/app_process", &args, ExecIdentity::Shell);
     command
-        .arg("/system/bin")
-        .arg("com.sidewire.ClipboardHelper")
-        .arg(operation)
         .env("CLASSPATH", helper)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -668,7 +682,6 @@ async fn run_clipboard_helper(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_identity(&mut command, ExecIdentity::Shell)?;
     let mut child = command.spawn().context("start Android clipboard helper")?;
     if let Some(text) = input {
         let mut stdin = child.stdin.take().context("open clipboard helper stdin")?;
@@ -689,68 +702,63 @@ async fn run_clipboard_helper(
 }
 
 #[cfg(target_os = "android")]
-fn apply_identity_now(identity: ExecIdentity) -> std::io::Result<()> {
-    if matches!(identity, ExecIdentity::Root) {
-        return Ok(());
+const SHELL_GROUPS: &[u32] = &[
+    1004, 1007, 1011, 1015, 1028, 1078, 1079, 2000, 3001, 3002, 3003, 3006, 3009, 3011, 3012,
+];
+
+#[cfg(any(target_os = "android", test))]
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
     }
-    const CONTEXT: &[u8] = b"u:r:shell:s0";
-    const GROUPS: [libc::gid_t; 15] = [
-        1004, 1007, 1011, 1015, 1028, 1078, 1079, 2000, 3001, 3002, 3003, 3006, 3009, 3011, 3012,
-    ];
-    let fd = unsafe {
-        libc::open(
-            c"/proc/self/attr/exec".as_ptr(),
-            libc::O_WRONLY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let rc = unsafe { libc::write(fd, CONTEXT.as_ptr().cast(), CONTEXT.len()) };
-    let saved = if rc < 0 {
-        Some(std::io::Error::last_os_error())
-    } else {
-        None
-    };
-    unsafe {
-        libc::close(fd);
-    }
-    if let Some(e) = saved {
-        return Err(e);
-    }
-    if unsafe { libc::setgroups(GROUPS.len(), GROUPS.as_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::setgid(2000) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::setuid(2000) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    quoted.push('\'');
+    quoted
 }
 
-fn apply_identity(command: &mut Command, identity: ExecIdentity) -> Result<()> {
-    #[cfg(target_os = "android")]
-    unsafe {
-        command.pre_exec(move || apply_identity_now(identity));
-    }
+fn command_for_identity(program: &str, args: &[String], identity: ExecIdentity) -> Command {
     #[cfg(not(target_os = "android"))]
-    {
-        let _ = (command, identity);
+    let _ = identity;
+    #[cfg(target_os = "android")]
+    if matches!(identity, ExecIdentity::Shell) {
+        let mut command = Command::new("/system/bin/su");
+        command
+            .arg("-p")
+            .arg("-Z")
+            .arg("u:r:shell:s0")
+            .arg("-g")
+            .arg("2000");
+        for group in SHELL_GROUPS {
+            command.arg("-G").arg(group.to_string());
+        }
+        command.arg("--ksu-no-new-privs").arg("2000").arg("-c");
+        let mut script = String::from("exec ");
+        script.push_str(&shell_quote(program));
+        for arg in args {
+            script.push(' ');
+            script.push_str(&shell_quote(arg));
+        }
+        command.arg(script);
+        return command;
     }
-    Ok(())
+
+    let mut command = Command::new(program);
+    command.args(args);
+    command
 }
 
 async fn handle_exec(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Result<()> {
     let request: ExecRequest = decode(payload)?;
-    let mut command = Command::new(&request.program);
+    let mut command = command_for_identity(&request.program, &request.args, request.identity);
     command
-        .args(&request.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_identity(&mut command, request.identity)?;
     if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
     }
@@ -806,10 +814,13 @@ async fn handle_exec(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Resu
 }
 
 async fn identity_command(identity: ExecIdentity, script: &str, path: &str) -> Result<Command> {
-    let mut command = Command::new("/system/bin/sh");
-    command.arg("-c").arg(script).arg("sidewire-file").arg(path);
-    apply_identity(&mut command, identity)?;
-    Ok(command)
+    let args = vec![
+        "-c".to_owned(),
+        script.to_owned(),
+        "sidewire-file".to_owned(),
+        path.to_owned(),
+    ];
+    Ok(command_for_identity("/system/bin/sh", &args, identity))
 }
 
 async fn file_size_for_identity(path: &str, identity: ExecIdentity) -> Result<u64> {
@@ -1085,11 +1096,7 @@ fn open_pty_master(
 }
 
 #[cfg(target_os = "android")]
-fn configure_pty_child(
-    slave_name: &std::ffi::CStr,
-    identity: ExecIdentity,
-    echo: bool,
-) -> std::io::Result<()> {
+fn configure_pty_child(slave_name: &std::ffi::CStr, echo: bool) -> std::io::Result<()> {
     if unsafe { libc::setsid() } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -1138,7 +1145,6 @@ fn configure_pty_child(
             libc::close(slave_fd);
         }
     }
-    apply_identity_now(identity)?;
     Ok(())
 }
 
@@ -1170,19 +1176,17 @@ async fn handle_pty(
         let hostname = android_shell_hostname();
         let (mut master_read, mut master_write, resize, slave_name) =
             open_pty_master(request.cols.max(1), request.rows.max(1))?;
-        let mut command = Command::new(&request.program);
+        let mut command = command_for_identity(&request.program, &request.args, request.identity);
         command
-            .args(&request.args)
             .env("TERM", &request.term)
             .env("COLORTERM", "truecolor")
             .env("HOSTNAME", hostname)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let identity = request.identity;
         let echo = request.echo;
         unsafe {
-            command.pre_exec(move || configure_pty_child(&slave_name, identity, echo));
+            command.pre_exec(move || configure_pty_child(&slave_name, echo));
         }
         let mut child = command
             .spawn()
@@ -1438,8 +1442,15 @@ async fn start_proxy(
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_shell_hostname;
+    use super::{sanitize_shell_hostname, shell_quote};
 
+    #[test]
+    fn shell_quote_preserves_arguments() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_quote("한글 $HOME ; x"), "'한글 $HOME ; x'");
+    }
     #[test]
     fn shell_hostname_is_safe_for_an_android_prompt() {
         assert_eq!(sanitize_shell_hostname(" a53x\n"), Some("a53x".to_owned()));

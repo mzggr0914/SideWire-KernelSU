@@ -53,7 +53,7 @@ impl DeviceTransport {
                 let frame = match reader.read_frame().await {
                     Ok(frame) => frame,
                     Err(error) => {
-                        tracing::debug!(%error, "device transport reader ended");
+                        tracing::warn!(%error, "device transport reader ended");
                         break;
                     }
                 };
@@ -65,6 +65,10 @@ impl DeviceTransport {
                             inner.routes.lock().await.remove(&stream_id);
                         }
                     }
+                    None if frame.kind == FrameKind::Pong => tracing::debug!(
+                        stream_id = frame.stream_id,
+                        "dropping late heartbeat response"
+                    ),
                     None => tracing::warn!(
                         stream_id = frame.stream_id,
                         kind = ?frame.kind,
