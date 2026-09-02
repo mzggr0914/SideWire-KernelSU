@@ -110,6 +110,6 @@ case "$1" in
   paired) paired;;
   unpair) unpair "$2";;
   unpair-all) unpair_all;;
-  log) tail -n 120 "$LOGFILE" 2>/dev/null;;
+  log) [ -f "$LOGFILE" ] && tail -n 120 "$LOGFILE" 2>/dev/null || true;;
   *) echo "usage: sidewirectl get|set|start|stop|restart|status|config|pair|paired|unpair|unpair-all|log"; exit 2;;
 esac

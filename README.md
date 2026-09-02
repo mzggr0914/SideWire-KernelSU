@@ -1,6 +1,6 @@
 # SideWire
 
-ADB-independent native control bridge for rooted Android devices. SideWire 0.9.0 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
+ADB-independent native control bridge for rooted Android devices. SideWire 0.9.1 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
 
 ## Components
 

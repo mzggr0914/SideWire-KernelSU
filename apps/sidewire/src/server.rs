@@ -658,7 +658,10 @@ async fn control_listener(control: &str, devices: DeviceMap) -> Result<()> {
             .reject_remote_clients(true)
             .first_pipe_instance(first)
             .create(control)
-            .with_context(|| format!("create control pipe {control}"))?;
+            .map_err(|error| {
+                if first && error.raw_os_error() == Some(5) { anyhow::anyhow!("SideWire control pipe {control} is already in use; another SideWire server may already be running") }
+                else { anyhow::anyhow!("create control pipe {control}: {error}") }
+            })?;
         first = false;
         server.connect().await?;
         tracing::info!(%control, "local CLI control connected");
