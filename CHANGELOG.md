@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- relicensed SideWire under GNU GPL v3 (`GPL-3.0-only`)
 - added native macOS host builds for Apple Silicon and Intel
 
 ## 0.9.4

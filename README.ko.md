@@ -2,12 +2,13 @@
 
 [English](README.md)
 
-SideWire는 루팅된 Android 기기를 Windows, macOS, Linux에서 제어하기 위한 네이티브 브리지입니다. 실제 세션은 ADB에 의존하지 않습니다.
+SideWire는 루팅된 Android 기기를 Windows, macOS, Linux에서 제어하기 위한 네이티브 브리지입니다. ADB에 의존하지 않습니다.
 
-Android 쪽은 KernelSU 모듈로 설치되는 Rust 데몬이고, PC 쪽은 Rust로 작성된 CLI/server입니다. 기본 설정은 보안 연결이며, 페어링 이후의 일반 통신은 인증과 암호화가 적용됩니다.
+KernelSU 모듈로 설치되는 Rust 데몬과, PC 쪽은 Rust로 작성된 CLI/server를 제공합니다.
 
-아직 1.0 이전 버전이라 지금은 기능을 계속 늘리기보다 실제 기기에서 안정적으로 동작하게 만드는 데 집중하고 있습니다.
+기본 설정은 보안 연결이며, 페어링 이후의 일반 통신은 인증과 암호화가 적용됩니다.
 
+ADB 의 대부분의 기능을 지원하지만, 내부적으로 ADB 를 사용하지 않기 때문에 Detect 되지 않습니다.
 ## 주요 기능
 
 - 대화형 shell / PTY와 단일 명령 실행
@@ -118,4 +119,4 @@ cargo test --workspace
 
 ## 라이선스
 
-Apache-2.0. 자세한 내용은 [LICENSE](LICENSE)를 참고하세요.
+GNU General Public License v3.0 (`GPL-3.0-only`)을 사용합니다. 자세한 내용은 [LICENSE](LICENSE)를 참고하세요.

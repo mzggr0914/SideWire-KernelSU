@@ -1,10 +1,14 @@
 # SideWire
 
-SideWire is a native bridge for controlling rooted Android devices from Windows, macOS or Linux without relying on ADB for the actual session.
+[한국어](README.ko.md)
 
-It combines a small Rust daemon packaged as a KernelSU module with a Rust desktop CLI/server. Secure pairing is the default, and normal traffic is authenticated and encrypted.
+SideWire is a native bridge for controlling rooted Android devices from Windows, macOS, or Linux. It does not rely on ADB.
 
-SideWire is still pre-1.0. The current focus is reliability and real-device testing rather than adding a long list of new features.
+It provides a Rust daemon installed as a KernelSU module and a Rust CLI/server on the host.
+
+Secure connections are the default, and normal traffic is authenticated and encrypted after pairing.
+
+It supports most of the workflows you would normally use ADB for, but ADB is not used internally, so SideWire does not show up as an ADB session.
 
 ## What it does
 
@@ -116,4 +120,4 @@ The wire protocol is currently `1.0` with capability negotiation for optional fe
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+GNU General Public License v3.0 (`GPL-3.0-only`). See [LICENSE](LICENSE).
