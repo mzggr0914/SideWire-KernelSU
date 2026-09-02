@@ -12,7 +12,7 @@ if (-not $versionMatch.Success) {
 $version = $versionMatch.Groups[1].Value
 
 $moduleProp = Get-Content (Join-Path $root "module\module.prop") -Raw
-if ($moduleProp -notmatch "(?m)^version=$([regex]::Escape($version))$") {
+if ($moduleProp -notmatch "(?m)^version=$([regex]::Escape($version))\r?$") {
     throw "module/module.prop version does not match Cargo.toml ($version)"
 }
 $customize = Get-Content (Join-Path $root "module\customize.sh") -Raw
