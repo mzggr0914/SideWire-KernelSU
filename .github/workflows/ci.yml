@@ -43,6 +43,34 @@ jobs:
         run: pnpm build
         working-directory: webui
 
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+      - run: cargo clippy -p sidewire -p sidewire-protocol --all-targets -- -D warnings
+      - run: cargo test -p sidewire -p sidewire-protocol
+      - run: cargo build --release -p sidewire
+
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+      - run: cargo clippy -p sidewire -p sidewire-protocol --all-targets -- -D warnings
+      - run: cargo test -p sidewire -p sidewire-protocol
+      - run: bash ./scripts/build-linux.sh
+
   macos:
     name: macOS (${{ matrix.arch }})
     strategy:
@@ -84,5 +112,6 @@ jobs:
       - name: Module shell syntax
         run: |
           sh -n module/bin/sidewirectl
+          sh -n module/action.sh
           sh -n module/customize.sh
           sh -n module/service.sh
