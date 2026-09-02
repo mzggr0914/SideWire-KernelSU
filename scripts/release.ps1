@@ -66,7 +66,7 @@ try {
     if ($entries | Where-Object { $_ -match '\\' }) {
         throw "Release ZIP contains Windows-style path separators"
     }
-    foreach ($required in @('module.prop', 'webroot/index.html', 'bin/sidewired', 'bin/sidewirectl')) {
+    foreach ($required in @('module.prop', 'webroot/index.html', 'bin/sidewired', 'bin/sidewirectl', 'bin/sidewire-clipboard.jar')) {
         if ($entries -notcontains $required) {
             throw "Release ZIP is missing required entry: $required"
         }

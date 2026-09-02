@@ -2,19 +2,59 @@ use anyhow::{Context, Result, bail};
 use sidewire_protocol::{
     DeviceId, PairBanner, PairCommit, PairComplete, PairReply, PairStart, SecurityBanner,
     SecurityClientHello, SecurityDecision, SecurityMode, SharedNoise, decode, encode, key_from_hex,
-    key_to_hex, noise_initiator, noise_responder, pairing_psk, read_noise_record, read_packet,
-    security_prologue, write_noise_record, write_packet,
+    key_to_hex, negotiated_version, noise_initiator, noise_responder, pairing_psk,
+    protocol_compatible, protocol_label, read_noise_record, read_packet, security_prologue,
+    write_noise_record, write_packet,
 };
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::{
+    collections::{HashMap, VecDeque},
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::{Mutex, Semaphore},
     time::{Duration, sleep, timeout},
 };
+
+const MAX_PAIRING_CONNECTIONS: usize = 4;
+const MAX_PAIRING_ATTEMPTS_PER_IP: usize = 5;
+const MAX_PIN_FAILURES: u8 = 5;
+const PAIRING_RATE_WINDOW: StdDuration = StdDuration::from_secs(60);
+
+#[derive(Default)]
+struct PairingGuard {
+    per_ip: HashMap<IpAddr, VecDeque<Instant>>,
+    current_pin: Option<String>,
+    failures: u8,
+}
+
+impl PairingGuard {
+    fn allow_ip(&mut self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let attempts = self.per_ip.entry(ip).or_default();
+        while attempts
+            .front()
+            .is_some_and(|at| now.duration_since(*at) > PAIRING_RATE_WINDOW)
+        {
+            attempts.pop_front();
+        }
+        if attempts.len() >= MAX_PAIRING_ATTEMPTS_PER_IP {
+            return false;
+        }
+        attempts.push_back(now);
+        true
+    }
+
+    fn clear_success(&mut self) {
+        self.current_pin = None;
+        self.failures = 0;
+    }
+}
 
 pub(super) struct ConnectionSecurity {
     pub peer_id: DeviceId,
@@ -92,13 +132,13 @@ pub(super) async fn accept_connection(
     )
     .await?;
     let hello: SecurityClientHello = read_packet(stream).await?;
-    if hello.protocol_version != sidewire_protocol::VERSION {
+    if !protocol_compatible(hello.protocol_version) {
         return reject(
             stream,
             format!(
                 "protocol mismatch: host {}, device {}",
-                hello.protocol_version,
-                sidewire_protocol::VERSION
+                protocol_label(hello.protocol_version),
+                protocol_label(sidewire_protocol::VERSION)
             ),
         )
         .await;
@@ -136,7 +176,9 @@ pub(super) async fn accept_connection(
     )
     .await?;
     let noise = if let Some(secret) = secret {
-        let prologue = security_prologue(hello.node_id, device_id);
+        let version =
+            negotiated_version(hello.protocol_version).context("no compatible protocol version")?;
+        let prologue = security_prologue(version, hello.node_id, device_id);
         Some(noise_responder(stream, &secret, &prologue).await?)
     } else {
         None
@@ -155,11 +197,11 @@ pub(super) async fn connect_connection(
     pairs_dir: Option<&str>,
 ) -> Result<ConnectionSecurity> {
     let banner: SecurityBanner = read_packet(stream).await?;
-    if banner.protocol_version != sidewire_protocol::VERSION {
+    if !protocol_compatible(banner.protocol_version) {
         bail!(
             "protocol mismatch: host {}, device {}",
-            banner.protocol_version,
-            sidewire_protocol::VERSION
+            protocol_label(banner.protocol_version),
+            protocol_label(sidewire_protocol::VERSION)
         );
     }
     if banner.security != mode {
@@ -190,7 +232,9 @@ pub(super) async fn connect_connection(
         SecurityMode::Insecure => None,
     };
     let noise = if let Some(secret) = secret {
-        let prologue = security_prologue(device_id, banner.node_id);
+        let version = negotiated_version(banner.protocol_version)
+            .context("no compatible protocol version")?;
+        let prologue = security_prologue(version, device_id, banner.node_id);
         Some(noise_initiator(stream, &secret, &prologue).await?)
     } else {
         None
@@ -227,12 +271,32 @@ fn pairing_pin(path: &str) -> Result<Option<String>> {
     Ok(Some(pin))
 }
 
+async fn record_pair_failure(pairing_file: &str, guard: &Arc<Mutex<PairingGuard>>) -> Result<bool> {
+    let Some(pin) = pairing_pin(pairing_file)? else {
+        return Ok(false);
+    };
+    let mut guard = guard.lock().await;
+    if guard.current_pin.as_deref() != Some(pin.as_str()) {
+        guard.current_pin = Some(pin);
+        guard.failures = 0;
+    }
+    guard.failures = guard.failures.saturating_add(1);
+    if guard.failures >= MAX_PIN_FAILURES {
+        let _ = fs::remove_file(pairing_file);
+        guard.current_pin = None;
+        guard.failures = 0;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 async fn handle_pair_connection(
     stream: &mut TcpStream,
     device_name: &str,
     device_id: DeviceId,
     pairing_file: &str,
     pairs_dir: &str,
+    commit_lock: &Arc<Mutex<()>>,
 ) -> Result<()> {
     let pin = pairing_pin(pairing_file)?;
     write_packet(
@@ -247,11 +311,17 @@ async fn handle_pair_connection(
     .await?;
     let pin = pin.context("pairing is not enabled or has expired")?;
     let start: PairStart = read_packet(stream).await?;
+    if !protocol_compatible(start.protocol_version) {
+        bail!("pairing protocol major mismatch");
+    }
+    let protocol = negotiated_version(start.protocol_version)
+        .context("no compatible pairing protocol version")?;
     let host_id_text = start.host_id.to_hex();
     let device_id_text = device_id.to_hex();
     let id_a = Identity::new(host_id_text.as_bytes());
     let id_b = Identity::new(device_id_text.as_bytes());
-    let (state, message) = Spake2::<Ed25519Group>::start_b(&Password::new(pin), &id_a, &id_b);
+    let (state, message) =
+        Spake2::<Ed25519Group>::start_b(&Password::new(pin.as_bytes()), &id_a, &id_b);
     write_packet(
         stream,
         &PairReply {
@@ -263,7 +333,7 @@ async fn handle_pair_connection(
         .finish(&start.spake_message)
         .map_err(|_| anyhow::anyhow!("pairing key exchange failed"))?;
     let pairing_key = pairing_psk(&shared, start.host_id, device_id);
-    let prologue = security_prologue(start.host_id, device_id);
+    let prologue = security_prologue(protocol, start.host_id, device_id);
     let noise = noise_responder(stream, &pairing_key, &prologue)
         .await
         .context("pairing authentication failed")?;
@@ -271,6 +341,10 @@ async fn handle_pair_connection(
     let commit: PairCommit = decode(&commit_bytes)?;
     if commit.host_id != start.host_id {
         bail!("pairing host identity changed during handshake");
+    }
+    let _commit_guard = commit_lock.lock().await;
+    if pairing_pin(pairing_file)?.as_deref() != Some(pin.as_str()) {
+        bail!("pairing PIN was already used or expired");
     }
     store_paired_host(
         pairs_dir,
@@ -298,38 +372,81 @@ pub(super) async fn run_pairing_listener(
     let listener = TcpListener::bind(("0.0.0.0", port))
         .await
         .with_context(|| format!("bind SideWire pairing listener tcp:{port}"))?;
+    let permits = Arc::new(Semaphore::new(MAX_PAIRING_CONNECTIONS));
+    let guard = Arc::new(Mutex::new(PairingGuard::default()));
+    let commit_lock = Arc::new(Mutex::new(()));
     tracing::info!(port, "SideWire pairing listener ready");
     loop {
         let (mut stream, peer) = listener.accept().await?;
-        let _ = stream.set_nodelay(true);
-        let result = timeout(
-            Duration::from_secs(65),
-            handle_pair_connection(
-                &mut stream,
-                &device_name,
-                device_id,
-                &pairing_file,
-                &pairs_dir,
-            ),
-        )
-        .await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%peer, %error, "pairing attempt failed");
-                sleep(Duration::from_millis(300)).await;
-            }
-            Err(_) => {
-                tracing::warn!(%peer, "pairing attempt timed out");
-                sleep(Duration::from_millis(300)).await;
-            }
+        let allowed = guard.lock().await.allow_ip(peer.ip());
+        if !allowed {
+            tracing::warn!(%peer, "pairing rate limit exceeded");
+            continue;
         }
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            tracing::warn!(%peer, "too many concurrent pairing attempts");
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let name = device_name.clone();
+        let pairing_file = pairing_file.clone();
+        let pairs_dir = pairs_dir.clone();
+        let guard = guard.clone();
+        let commit_lock = commit_lock.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = timeout(
+                Duration::from_secs(65),
+                handle_pair_connection(
+                    &mut stream,
+                    &name,
+                    device_id,
+                    &pairing_file,
+                    &pairs_dir,
+                    &commit_lock,
+                ),
+            )
+            .await;
+            match result {
+                Ok(Ok(())) => guard.lock().await.clear_success(),
+                Ok(Err(error)) => {
+                    tracing::warn!(%peer, %error, "pairing attempt failed");
+                    if record_pair_failure(&pairing_file, &guard)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        tracing::warn!("pairing PIN disabled after too many failed attempts");
+                    }
+                    sleep(Duration::from_millis(300)).await;
+                }
+                Err(_) => {
+                    tracing::warn!(%peer, "pairing attempt timed out");
+                    if record_pair_failure(&pairing_file, &guard)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        tracing::warn!("pairing PIN disabled after too many failed attempts");
+                    }
+                }
+            }
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_guard_rate_limits_an_ip() {
+        let mut guard = PairingGuard::default();
+        let ip: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        for _ in 0..MAX_PAIRING_ATTEMPTS_PER_IP {
+            assert!(guard.allow_ip(ip));
+        }
+        assert!(!guard.allow_ip(ip));
+        assert!(guard.allow_ip("192.0.2.11".parse().unwrap()));
+    }
 
     #[test]
     fn expired_or_missing_pairing_file_is_inactive() {

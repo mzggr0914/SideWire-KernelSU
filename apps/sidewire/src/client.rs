@@ -4,10 +4,7 @@ pub(super) async fn request_control(
     control: &str,
     request: &ControlRequest,
 ) -> Result<ControlResponse> {
-    let mut stream = TcpStream::connect(control)
-        .await
-        .with_context(|| format!("connect to SideWire server control {control}"))?;
-    stream.set_nodelay(true).context("enable TCP_NODELAY")?;
+    let mut stream = crate::control::connect(control).await?;
     let mut encoded = serde_json::to_vec(request)?;
     encoded.push(b'\n');
     stream.write_all(&encoded).await?;
@@ -74,18 +71,19 @@ pub(super) async fn run_devices(control: &str, config: &crate::config::AppConfig
             .filter(|device| selector_matches(device, selector))
             .count()
     });
-    println!("DEFAULT\tID\tNAME\tMODE\tSECURITY\tPEER");
+    println!("DEFAULT\tID\tNAME\tMODE\tSECURITY\tPROTOCOL\tPEER");
     for device in devices {
         let is_default = config.default_device.as_deref().is_some_and(|selector| {
             default_matches == Some(1) && selector_matches(&device, selector)
         });
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             if is_default { "*" } else { "" },
             &device.id[..8],
             device.name,
             device.mode,
             device.security,
+            device.protocol,
             device.peer
         );
     }
@@ -130,8 +128,11 @@ pub(super) async fn run_doctor(
     app_config: &crate::config::AppConfig,
 ) -> Result<()> {
     println!("SideWire CLI\t{}", env!("CARGO_PKG_VERSION"));
-    println!("Protocol\t{}", sidewire_protocol::VERSION);
-    println!("Control\t{control}");
+    println!(
+        "Protocol\t{}",
+        sidewire_protocol::protocol_label(sidewire_protocol::VERSION)
+    );
+    println!("Control IPC\t{} ({control})", crate::control::kind());
     println!("Config\t{}", crate::config::config_path()?.display());
     println!(
         "Configured connect\t{}",
@@ -147,6 +148,27 @@ pub(super) async fn run_doctor(
     println!("Device\t{} [{}]", device.name, &device.id[..8]);
     println!("Mode\t{}", device.mode);
     println!("Security\t{}", device.security);
+    if device.security == "secure" {
+        let id = sidewire_protocol::DeviceId::parse(&device.id)?;
+        let paired = crate::trust::device_secret(id)?.is_some();
+        println!(
+            "Authentication\t{}",
+            if paired {
+                "paired"
+            } else {
+                "missing-local-trust"
+            }
+        );
+        println!("Transport crypto\tNoise NNpsk0 / 25519 / ChaChaPoly / BLAKE2s");
+    } else {
+        println!("Authentication\tdisabled");
+        println!("Transport crypto\tdisabled");
+    }
+    println!("Protocol negotiated\t{}", device.protocol);
+    println!(
+        "Capabilities\t{}",
+        sidewire_protocol::capabilities::display(device.capabilities)
+    );
     println!("Peer\t{}", device.peer);
 
     match request_control(
@@ -268,10 +290,7 @@ pub(super) async fn run_exec_client(
         cwd: None,
         run_as,
     };
-    let mut stream = TcpStream::connect(control)
-        .await
-        .with_context(|| format!("connect to SideWire server control {control}"))?;
-    stream.set_nodelay(true).context("enable TCP_NODELAY")?;
+    let mut stream = crate::control::connect(control).await?;
     let mut encoded = serde_json::to_vec(&request)?;
     encoded.push(b'\n');
     stream.write_all(&encoded).await?;
@@ -547,6 +566,56 @@ pub(super) async fn run_packages(
     run_exec_checked(control, device, run_as, "/system/bin/pm", args).await
 }
 
+async fn clipboard_get(control: &str, device: Option<String>) -> Result<String> {
+    match request_control(control, &ControlRequest::ClipboardGet { device }).await? {
+        ControlResponse::Clipboard { text } => Ok(text),
+        ControlResponse::Error { message } => bail!(message),
+        _ => bail!("unexpected clipboard response"),
+    }
+}
+
+async fn clipboard_set(control: &str, device: Option<String>, text: String) -> Result<()> {
+    match request_control(control, &ControlRequest::ClipboardSet { device, text }).await? {
+        ControlResponse::Ok { .. } => Ok(()),
+        ControlResponse::Error { message } => bail!(message),
+        _ => bail!("unexpected clipboard response"),
+    }
+}
+
+pub(super) async fn run_clipboard(
+    control: &str,
+    device: Option<String>,
+    command: ClipboardCommand,
+) -> Result<()> {
+    match command {
+        ClipboardCommand::Get => {
+            let text = clipboard_get(control, device).await?;
+            print!("{text}");
+            io::stdout().flush()?;
+            Ok(())
+        }
+        ClipboardCommand::Set { text } => clipboard_set(control, device, text).await,
+        ClipboardCommand::Push => {
+            let mut host = arboard::Clipboard::new().context("open PC clipboard")?;
+            let text = host.get_text().context("read PC clipboard text")?;
+            clipboard_set(control, device, text).await
+        }
+        ClipboardCommand::Pull => {
+            let text = clipboard_get(control, device).await?;
+            let mut host = arboard::Clipboard::new().context("open PC clipboard")?;
+            host.set_text(text).context("write PC clipboard text")?;
+            Ok(())
+        }
+        ClipboardCommand::Clear => {
+            match request_control(control, &ControlRequest::ClipboardClear { device }).await? {
+                ControlResponse::Ok { .. } => Ok(()),
+                ControlResponse::Error { message } => bail!(message),
+                _ => bail!("unexpected clipboard response"),
+            }
+        }
+    }
+}
+
 pub(super) async fn run_app(
     control: &str,
     device: Option<String>,
@@ -605,6 +674,8 @@ mod tests {
             peer: "127.0.0.1:1".into(),
             mode: "outbound".into(),
             security: "secure".into(),
+            protocol: "1.0".into(),
+            capabilities: sidewire_protocol::capabilities::ALL,
         }
     }
 

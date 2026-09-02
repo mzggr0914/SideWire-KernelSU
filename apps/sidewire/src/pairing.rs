@@ -1,8 +1,8 @@
 use super::*;
 use sidewire_protocol::{
     PAIRING_PORT, PairBanner, PairCommit, PairComplete, PairReply, PairStart, decode, encode,
-    noise_initiator, pairing_psk, read_noise_record, read_packet, security_prologue,
-    write_noise_record, write_packet,
+    negotiated_version, noise_initiator, pairing_psk, protocol_compatible, protocol_label,
+    read_noise_record, read_packet, security_prologue, write_noise_record, write_packet,
 };
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 
@@ -37,7 +37,7 @@ pub(super) async fn run_pair(target: Option<String>, discover: bool) -> Result<(
             crate::discovery::discover_all(tokio::time::Duration::from_millis(1200)).await?;
         let compatible: Vec<_> = found
             .into_iter()
-            .filter(|d| d.protocol_version == sidewire_protocol::VERSION)
+            .filter(|d| protocol_compatible(d.protocol_version))
             .collect();
         match compatible.len() {
             0 => bail!("no pairable SideWire device discovered"),
@@ -60,13 +60,15 @@ pub(super) async fn run_pair(target: Option<String>, discover: bool) -> Result<(
         .with_context(|| format!("connect SideWire pairing endpoint {endpoint}"))?;
     stream.set_nodelay(true)?;
     let banner: PairBanner = read_packet(&mut stream).await?;
-    if banner.protocol_version != sidewire_protocol::VERSION {
+    if !protocol_compatible(banner.protocol_version) {
         bail!(
             "pairing protocol mismatch: device {}, host {}",
-            banner.protocol_version,
-            sidewire_protocol::VERSION
+            protocol_label(banner.protocol_version),
+            protocol_label(sidewire_protocol::VERSION)
         );
     }
+    let protocol = negotiated_version(banner.protocol_version)
+        .context("no compatible pairing protocol version")?;
     if !banner.pairing_available {
         bail!("pairing is not enabled on {}", banner.name);
     }
@@ -82,6 +84,7 @@ pub(super) async fn run_pair(target: Option<String>, discover: bool) -> Result<(
     write_packet(
         &mut stream,
         &PairStart {
+            protocol_version: protocol,
             host_id,
             host_name: host_name.clone(),
             spake_message: message,
@@ -93,7 +96,7 @@ pub(super) async fn run_pair(target: Option<String>, discover: bool) -> Result<(
         .finish(&reply.spake_message)
         .map_err(|_| anyhow::anyhow!("pairing key exchange failed"))?;
     let pairing_key = pairing_psk(&shared, host_id, banner.device_id);
-    let prologue = security_prologue(host_id, banner.device_id);
+    let prologue = security_prologue(protocol, host_id, banner.device_id);
     let noise = noise_initiator(&mut stream, &pairing_key, &prologue)
         .await
         .context("pairing authentication failed; check the PIN")?;

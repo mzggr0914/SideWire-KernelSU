@@ -1,6 +1,6 @@
 # SideWire
 
-ADB-independent native control bridge for rooted Android devices. SideWire 0.8.0 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
+ADB-independent native control bridge for rooted Android devices. SideWire 0.9.0 consists of a Rust desktop CLI/server, a Rust Android daemon packaged as a KernelSU module, and a shared framed protocol.
 
 ## Components
 
@@ -30,7 +30,7 @@ This creates:
 
 ```text
 dist/sidewire.exe
-dist/SideWire-KernelSU-v0.8.0-arm64.zip
+dist/SideWire-KernelSU-v0.9.0-arm64.zip
 ```
 
 The packager verifies required module entries and rejects Windows-style `\` separators inside the ZIP so KernelSU can detect `webroot/index.html` correctly.
@@ -53,7 +53,7 @@ powershell -File .\scripts\build-linux.ps1
 powershell -File .\scripts\release-linux.ps1
 ```
 
-The Linux release is written as `dist/sidewire-v0.8.0-linux-<arch>`. To build every platform from Windows, use `powershell -File .\scripts\build-all.ps1` or `powershell -File .\scripts\release-all.ps1`. Add `-SetupLinux` on the first run.
+The Linux release is written as `dist/sidewire-v0.9.0-linux-<arch>`. To build every platform from Windows, use `powershell -File .\scripts\build-all.ps1` or `powershell -File .\scripts\release-all.ps1`. Add `-SetupLinux` on the first run.
 
 ## Desktop convenience config
 
@@ -69,9 +69,13 @@ SideWire stores optional desktop defaults in `%APPDATA%\SideWire\config.json` on
 
 When `connect` is configured, plain `sidewire server` maintains that explicit inbound endpoint. `default-device` accepts a unique device name or device-ID prefix and is used whenever `-s` is omitted. `run-as` provides the default identity for commands that support `--as`. Explicit CLI flags always win.
 
+### Local control IPC
+
+The desktop CLI no longer exposes a localhost TCP control port. On Windows it talks to the server through `\\.\pipe\sidewire`; on Linux/Unix it uses a `sidewire.sock` Unix socket under `$XDG_RUNTIME_DIR` when available, otherwise beside the SideWire config. Unix sockets are created with mode `0600`. Use the global `--control <PIPE|SOCKET>` option only when an alternate local IPC endpoint is needed.
+
 ## Security and pairing
 
-SideWire 0.8.0 uses authenticated, encrypted connections by default. Pair each PC once from the Android WebUI: start SideWire, press **Generate pairing PIN**, then enter the six-digit PIN on the PC.
+SideWire 0.9.0 uses authenticated, encrypted connections by default. Pair each PC once from the Android WebUI: start SideWire, press **Generate pairing PIN**, then enter the six-digit PIN on the PC.
 
 ```powershell
 .\dist\sidewire.exe pair 192.168.0.123
@@ -80,7 +84,9 @@ SideWire 0.8.0 uses authenticated, encrypted connections by default. Pair each P
 .\dist\sidewire.exe paired
 ```
 
-The PIN is valid for 60 seconds and is only used for SPAKE2 pairing. A successful pairing exchanges a random 256-bit long-term secret; later connections authenticate and encrypt automatically without asking for the PIN again. The desktop stores its host identity and paired-device secrets in `trust.json` next to the normal SideWire config. Android stores paired-host secrets under the module's private `config/paired_hosts` directory.
+The PIN is valid for 60 seconds and is only used for SPAKE2 pairing. A successful pairing exchanges a random 256-bit long-term secret; later connections authenticate and encrypt automatically without asking for the PIN again. Pairing accepts at most four concurrent handshakes, rate-limits each source IP to five attempts per minute, and disables the current PIN after five failed attempts. A PIN is single-use: once one pairing commits successfully, concurrent attempts using the same PIN cannot also commit.
+
+The desktop stores its host identity and paired-device secrets in `trust.json` next to the normal SideWire config. Android stores persistent security state under `/data/adb/sidewire/`; upgrades automatically migrate paired-host secrets from the SideWire 0.8 module-local state when present, so normal module upgrades do not require pairing again. The WebUI can remove one paired PC or remove all pairings.
 
 Normal SideWire frames use a Noise PSK session (`25519` + `ChaChaPoly` + `BLAKE2s`) after authentication. Exec, PTY, file transfer, and secure forward/reverse proxy traffic are protected. UDP discovery is only locator metadata and is not itself trusted; the following TCP security handshake authenticates a paired peer.
 
@@ -147,6 +153,21 @@ Every module installation gets a persistent 128-bit SideWire device ID. The host
 
 `exec --all` and `push --all` run per-device work concurrently. `--all` cannot be combined with `-s`. Without `-s`, SideWire uses `default-device` when configured, otherwise it auto-selects only when exactly one device is connected.
 
+## Clipboard
+
+SideWire 0.9 adds text clipboard transport. The Android daemon advertises the clipboard capability only when its packaged helper is available, so unsupported devices fail cleanly instead of receiving an unknown request. Clipboard traffic runs inside the normal authenticated/encrypted SideWire session in secure mode.
+
+```powershell
+.\dist\sidewire.exe clipboard get
+.\dist\sidewire.exe clipboard set "hello from PC"
+.\dist\sidewire.exe clipboard push   # PC system clipboard -> Android
+.\dist\sidewire.exe clipboard pull   # Android -> PC system clipboard
+.\dist\sidewire.exe clipboard clear
+.\dist\sidewire.exe clipboard -s a1b2c3d4 pull
+```
+
+Clipboard text is limited to 4 MiB. The Android helper runs with the shell identity through `app_process`; actual device/ROM clipboard behavior should be validated on the target Android builds.
+
 ## Shell and Tab completion
 On Windows, the default shell keeps cooked console editing for low-latency local typing. SideWire completes against the live Android PTY context:
 
@@ -175,7 +196,7 @@ On Linux/Unix, the default shell uses the raw PTY path so the remote shell provi
 .\dist\sidewire.exe wait-for-device --timeout 30
 ```
 
-`doctor` checks the local control server, connected device, protocol round trip, Android model/version, shell identity and root execution. `wait-for-device` also tolerates the local server being temporarily unavailable and can be used after reboot; use `--timeout 0` to wait indefinitely.
+`doctor` reports the local IPC type, paired/encryption status, negotiated protocol/capabilities, round-trip latency, Android model/version, shell identity and root execution. `wait-for-device` also tolerates the local server being temporarily unavailable and can be used after reboot; use `--timeout 0` to wait indefinitely.
 
 `push` and `pull` automatically recurse when the source path is a directory:
 
@@ -196,6 +217,8 @@ Recursive push preserves the directory tree and rejects local symlinks rather th
 .\dist\sidewire.exe logcat
 .\dist\sidewire.exe packages
 .\dist\sidewire.exe app start com.example.app
+.\dist\sidewire.exe clipboard push
+.\dist\sidewire.exe clipboard pull
 ```
 ## Development checks
 
@@ -217,7 +240,7 @@ CARGO_TARGET_DIR=target-linux cargo test --workspace
 bash ./scripts/release-linux.sh
 ```
 
-The shared wire protocol is version 9. Protocol changes require rebuilding both the desktop CLI and Android module; mismatched protocol versions are rejected during frame decoding.
+The shared wire protocol is now `1.0`. The frame version encodes protocol major/minor; peers with the same major may connect and negotiate the lower minor version. `Hello`/`HelloAck` exchange capability bitsets and SideWire uses their intersection, so adding an optional feature no longer requires breaking every existing connection. A protocol-major mismatch is rejected.
 
 ## Security notes
 

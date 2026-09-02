@@ -2,8 +2,9 @@ use super::*;
 use crate::transport::DeviceTransport;
 use sidewire_protocol::{
     DeviceId, SecureFrameReader, SecureFrameWriter, SecurityBanner, SecurityClientHello,
-    SecurityDecision, SecurityMode, SharedNoise, noise_initiator, noise_responder, read_packet,
-    security_prologue, write_packet,
+    SecurityDecision, SecurityMode, SharedNoise, negotiated_version, noise_initiator,
+    noise_responder, protocol_compatible, protocol_label, read_packet, security_prologue,
+    write_packet,
 };
 use std::collections::HashSet;
 
@@ -36,6 +37,8 @@ struct DeviceSession {
     transport: DeviceTransport,
     security: SecurityMode,
     shared_secret: Option<[u8; 32]>,
+    capabilities: u64,
+    protocol: u16,
 }
 
 type DeviceMap = Arc<RwLock<HashMap<DeviceId, DeviceSession>>>;
@@ -46,6 +49,8 @@ pub(super) struct DeviceInfo {
     pub(super) peer: String,
     pub(super) mode: String,
     pub(super) security: String,
+    pub(super) protocol: String,
+    pub(super) capabilities: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,6 +96,16 @@ pub(super) enum ControlRequest {
         term: String,
         echo: bool,
     },
+    ClipboardGet {
+        device: Option<String>,
+    },
+    ClipboardSet {
+        device: Option<String>,
+        text: String,
+    },
+    ClipboardClear {
+        device: Option<String>,
+    },
     Forward {
         device: Option<String>,
         local_port: u16,
@@ -127,6 +142,9 @@ pub(super) enum ControlResponse {
         stdout: String,
         stderr: String,
         code: Option<i32>,
+    },
+    Clipboard {
+        text: String,
     },
     Ok {
         message: String,
@@ -198,6 +216,8 @@ async fn device_listener(bind: &str, devices: DeviceMap, security: SecurityMode)
                     transport: transport.clone(),
                     security: identity.security,
                     shared_secret: identity.shared_secret,
+                    capabilities: identity.capabilities,
+                    protocol: identity.protocol,
                 };
                 if let Err(error) = register_device(&devices, session).await {
                     tracing::warn!(%peer, %error, "outbound device rejected");
@@ -214,6 +234,8 @@ struct DeviceIdentity {
     security: SecurityMode,
     noise: Option<SharedNoise>,
     shared_secret: Option<[u8; 32]>,
+    capabilities: u64,
+    protocol: u16,
 }
 
 async fn accept_security(
@@ -231,11 +253,11 @@ async fn accept_security(
     )
     .await?;
     let hello: SecurityClientHello = read_packet(stream).await?;
-    if hello.protocol_version != sidewire_protocol::VERSION {
+    if !protocol_compatible(hello.protocol_version) {
         let message = format!(
             "protocol mismatch: peer {}, host {}",
-            hello.protocol_version,
-            sidewire_protocol::VERSION
+            protocol_label(hello.protocol_version),
+            protocol_label(sidewire_protocol::VERSION)
         );
         write_packet(
             stream,
@@ -293,7 +315,9 @@ async fn accept_security(
     )
     .await?;
     let noise = if let Some(secret) = secret {
-        let prologue = security_prologue(hello.node_id, host_id);
+        let version =
+            negotiated_version(hello.protocol_version).context("no compatible protocol version")?;
+        let prologue = security_prologue(version, hello.node_id, host_id);
         Some(noise_responder(stream, &secret, &prologue).await?)
     } else {
         None
@@ -306,11 +330,11 @@ async fn connect_security(
     security: SecurityMode,
 ) -> Result<(DeviceId, Option<SharedNoise>, Option<[u8; 32]>)> {
     let banner: SecurityBanner = read_packet(stream).await?;
-    if banner.protocol_version != sidewire_protocol::VERSION {
+    if !protocol_compatible(banner.protocol_version) {
         bail!(
             "protocol mismatch: device {}, host {}",
-            banner.protocol_version,
-            sidewire_protocol::VERSION
+            protocol_label(banner.protocol_version),
+            protocol_label(sidewire_protocol::VERSION)
         );
     }
     if banner.security != security {
@@ -346,7 +370,9 @@ async fn connect_security(
         bail!(decision.message);
     }
     let noise = if let Some(secret) = secret {
-        let prologue = security_prologue(host_id, banner.node_id);
+        let version = negotiated_version(banner.protocol_version)
+            .context("no compatible protocol version")?;
+        let prologue = security_prologue(version, host_id, banner.node_id);
         Some(noise_initiator(stream, &secret, &prologue).await?)
     } else {
         None
@@ -364,6 +390,12 @@ async fn accept_device(stream: &mut TcpStream, security: SecurityMode) -> Result
         bail!("expected device Hello");
     }
     let hello: Hello = decode(&hello_frame.payload)?;
+    let protocol = negotiated_version(hello.protocol_version)
+        .context("device protocol major is incompatible")?;
+    let capabilities = hello.capabilities & sidewire_protocol::capabilities::ALL;
+    if capabilities & sidewire_protocol::capabilities::CORE == 0 {
+        bail!("device does not advertise the core capability");
+    }
     let id = hello
         .device_id
         .context("device Hello did not include device_id")?;
@@ -375,6 +407,8 @@ async fn accept_device(stream: &mut TcpStream, security: SecurityMode) -> Result
         name: "sidewire-server".into(),
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
+        protocol_version: sidewire_protocol::VERSION,
+        capabilities: sidewire_protocol::capabilities::ALL,
     };
     {
         let mut writer = SecureFrameWriter::new(&mut *stream, noise.clone());
@@ -388,6 +422,8 @@ async fn accept_device(stream: &mut TcpStream, security: SecurityMode) -> Result
         security,
         noise,
         shared_secret,
+        capabilities,
+        protocol,
     })
 }
 
@@ -398,6 +434,7 @@ async fn connect_device(stream: &mut TcpStream, security: SecurityMode) -> Resul
         name: "sidewire-server".into(),
         role: sidewire_protocol::PeerRole::Host,
         protocol_version: sidewire_protocol::VERSION,
+        capabilities: sidewire_protocol::capabilities::ALL,
     };
     {
         let mut writer = SecureFrameWriter::new(&mut *stream, noise.clone());
@@ -413,11 +450,23 @@ async fn connect_device(stream: &mut TcpStream, security: SecurityMode) -> Resul
         bail!("expected device HelloAck");
     }
     let ack: HelloAck = decode(&ack_frame.payload)?;
+    let protocol = negotiated_version(ack.protocol_version)
+        .context("device protocol major is incompatible")?;
+    let capabilities = ack.capabilities & sidewire_protocol::capabilities::ALL;
+    if capabilities & sidewire_protocol::capabilities::CORE == 0 {
+        bail!("device does not advertise the core capability");
+    }
     let id = ack
         .device_id
         .context("device HelloAck did not include device_id")?;
     if id != security_id {
         bail!("device identity changed after security handshake");
+    }
+    if !protocol_compatible(ack.protocol_version) {
+        bail!(
+            "protocol mismatch after HelloAck: device {}",
+            protocol_label(ack.protocol_version)
+        );
     }
     if ack.name.trim().is_empty() {
         bail!("device returned an empty name");
@@ -428,6 +477,8 @@ async fn connect_device(stream: &mut TcpStream, security: SecurityMode) -> Resul
         security,
         noise,
         shared_secret,
+        capabilities,
+        protocol,
     })
 }
 
@@ -501,6 +552,8 @@ async fn connect_endpoint_once(
         transport: transport.clone(),
         security: identity.security,
         shared_secret: identity.shared_secret,
+        capabilities: identity.capabilities,
+        protocol: identity.protocol,
     };
     register_device(devices, session).await?;
     transport.wait_closed().await;
@@ -560,12 +613,12 @@ async fn discovered_device_manager(devices: DeviceMap, security: SecurityMode) {
         match crate::discovery::discover_all(tokio::time::Duration::from_millis(1200)).await {
             Ok(found) => {
                 for device in found {
-                    if device.protocol_version != sidewire_protocol::VERSION {
+                    if !sidewire_protocol::protocol_compatible(device.protocol_version) {
                         tracing::warn!(
                             device = %device.name,
                             device_id = %device.device_id.short(),
-                            device_protocol = device.protocol_version,
-                            host_protocol = sidewire_protocol::VERSION,
+                            device_protocol = %sidewire_protocol::protocol_label(device.protocol_version),
+                            host_protocol = %sidewire_protocol::protocol_label(sidewire_protocol::VERSION),
                             "ignoring discovered device with incompatible protocol"
                         );
                         continue;
@@ -596,12 +649,47 @@ async fn discovered_device_manager(devices: DeviceMap, security: SecurityMode) {
     }
 }
 
+#[cfg(windows)]
 async fn control_listener(control: &str, devices: DeviceMap) -> Result<()> {
-    let listener = TcpListener::bind(control)
-        .await
-        .with_context(|| format!("bind control listener {control}"))?;
-    tracing::info!(%control, "local CLI control ready");
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let mut first = true;
+    loop {
+        let server = ServerOptions::new()
+            .reject_remote_clients(true)
+            .first_pipe_instance(first)
+            .create(control)
+            .with_context(|| format!("create control pipe {control}"))?;
+        first = false;
+        server.connect().await?;
+        tracing::info!(%control, "local CLI control connected");
+        let devices = devices.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_control(server, devices).await {
+                tracing::warn!(%error, "control request failed");
+            }
+        });
+    }
+}
 
+#[cfg(unix)]
+async fn control_listener(control: &str, devices: DeviceMap) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::{UnixListener, UnixStream};
+
+    let path = std::path::Path::new(control);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        if UnixStream::connect(path).await.is_ok() {
+            bail!("SideWire control socket is already active at {control}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("bind control socket {control}"))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    tracing::info!(%control, "local CLI control ready");
     loop {
         let (stream, _) = listener.accept().await?;
         let devices = devices.clone();
@@ -613,7 +701,10 @@ async fn control_listener(control: &str, devices: DeviceMap) -> Result<()> {
     }
 }
 
-async fn handle_control(stream: TcpStream, devices: DeviceMap) -> Result<()> {
+async fn handle_control<S>(stream: S, devices: DeviceMap) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     if reader.read_line(&mut line).await? == 0 {
@@ -661,15 +752,18 @@ async fn handle_control(stream: TcpStream, devices: DeviceMap) -> Result<()> {
     }
 }
 
-async fn handle_control_exec_stream(
-    mut reader: BufReader<TcpStream>,
+async fn handle_control_exec_stream<S>(
+    mut reader: BufReader<S>,
     devices: &DeviceMap,
     device: Option<String>,
     program: String,
     args: Vec<String>,
     cwd: Option<String>,
     run_as: RunAs,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (_, session) = match resolve_device(devices, device.as_deref()).await {
         Ok(selected) => selected,
         Err(error) => {
@@ -711,11 +805,14 @@ async fn handle_control_exec_stream(
     }
 }
 
-async fn handle_control_pty(
-    mut reader: BufReader<TcpStream>,
+async fn handle_control_pty<S>(
+    mut reader: BufReader<S>,
     devices: &DeviceMap,
     options: PtyControlOptions,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let PtyControlOptions {
         device,
         program,
@@ -847,6 +944,8 @@ async fn process_control(request: ControlRequest, devices: &DeviceMap) -> Contro
                     peer: session.peer.clone(),
                     mode: session.mode.as_str().to_owned(),
                     security: session.security.as_str().to_owned(),
+                    protocol: protocol_label(session.protocol),
+                    capabilities: session.capabilities,
                 })
                 .collect();
             list.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
@@ -926,6 +1025,49 @@ async fn process_control(request: ControlRequest, devices: &DeviceMap) -> Contro
         ControlRequest::Pty { .. } => ControlResponse::Error {
             message: "PTY request must use streaming control".into(),
         },
+        ControlRequest::ClipboardGet { device } => {
+            match resolve_device(devices, device.as_deref()).await {
+                Ok((_, session)) => match remote_clipboard_get(&session).await {
+                    Ok(text) => ControlResponse::Clipboard { text },
+                    Err(error) => ControlResponse::Error {
+                        message: error.to_string(),
+                    },
+                },
+                Err(error) => ControlResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        ControlRequest::ClipboardSet { device, text } => {
+            match resolve_device(devices, device.as_deref()).await {
+                Ok((_, session)) => match remote_clipboard_set(&session, text).await {
+                    Ok(()) => ControlResponse::Ok {
+                        message: "Android clipboard updated".into(),
+                    },
+                    Err(error) => ControlResponse::Error {
+                        message: error.to_string(),
+                    },
+                },
+                Err(error) => ControlResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        ControlRequest::ClipboardClear { device } => {
+            match resolve_device(devices, device.as_deref()).await {
+                Ok((_, session)) => match remote_clipboard_clear(&session).await {
+                    Ok(()) => ControlResponse::Ok {
+                        message: "Android clipboard cleared".into(),
+                    },
+                    Err(error) => ControlResponse::Error {
+                        message: error.to_string(),
+                    },
+                },
+                Err(error) => ControlResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         ControlRequest::Forward {
             device,
             local_port,
@@ -1045,6 +1187,75 @@ async fn remote_ping(session: &DeviceSession) -> Result<u64> {
             String::from_utf8_lossy(&response.payload)
         ),
         other => bail!("unexpected ping response {other:?}"),
+    }
+}
+
+fn require_capability(session: &DeviceSession, capability: u64, name: &str) -> Result<()> {
+    if session.capabilities & capability == 0 {
+        bail!("device does not support {name}");
+    }
+    Ok(())
+}
+
+async fn remote_clipboard_get(session: &DeviceSession) -> Result<String> {
+    require_capability(
+        session,
+        sidewire_protocol::capabilities::CLIPBOARD,
+        "clipboard",
+    )?;
+    let mut stream = session.transport.open_stream().await?;
+    stream.send_raw(FrameKind::ClipboardGet, &[]).await?;
+    let response = stream.recv().await?;
+    match response.kind {
+        FrameKind::ClipboardData => Ok(decode::<ClipboardData>(&response.payload)?
+            .text
+            .unwrap_or_default()),
+        FrameKind::Error => bail!(
+            "remote clipboard error: {}",
+            String::from_utf8_lossy(&response.payload)
+        ),
+        other => bail!("unexpected clipboard response {other:?}"),
+    }
+}
+
+async fn remote_clipboard_set(session: &DeviceSession, text: String) -> Result<()> {
+    require_capability(
+        session,
+        sidewire_protocol::capabilities::CLIPBOARD,
+        "clipboard",
+    )?;
+    let mut stream = session.transport.open_stream().await?;
+    let request = ClipboardSetRequest { text };
+    stream
+        .send(&frame(FrameKind::ClipboardSet, stream.id(), &request)?)
+        .await?;
+    let response = stream.recv().await?;
+    match response.kind {
+        FrameKind::ClipboardData => Ok(()),
+        FrameKind::Error => bail!(
+            "remote clipboard error: {}",
+            String::from_utf8_lossy(&response.payload)
+        ),
+        other => bail!("unexpected clipboard response {other:?}"),
+    }
+}
+
+async fn remote_clipboard_clear(session: &DeviceSession) -> Result<()> {
+    require_capability(
+        session,
+        sidewire_protocol::capabilities::CLIPBOARD,
+        "clipboard",
+    )?;
+    let mut stream = session.transport.open_stream().await?;
+    stream.send_raw(FrameKind::ClipboardClear, &[]).await?;
+    let response = stream.recv().await?;
+    match response.kind {
+        FrameKind::ClipboardData => Ok(()),
+        FrameKind::Error => bail!(
+            "remote clipboard error: {}",
+            String::from_utf8_lossy(&response.payload)
+        ),
+        other => bail!("unexpected clipboard response {other:?}"),
     }
 }
 

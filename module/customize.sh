@@ -1,12 +1,26 @@
 #!/system/bin/sh
-ui_print "- SideWire 0.8.0"
+ui_print "- SideWire 0.9.0"
 ui_print "- Root/shell execution + KernelSU WebUI"
 [ "$ARCH" = "arm64" ] || abort "SideWire currently supports arm64 only"
 set_perm "$MODPATH/bin/sidewired" 0 0 0755
 set_perm "$MODPATH/bin/sidewirectl" 0 0 0755
+set_perm "$MODPATH/bin/sidewire-clipboard.jar" 0 0 0644
 set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/sepolicy.rule" 0 0 0644
 export KSU_MODULE=sidewire
+STATE_DIR="/data/adb/sidewire"
+PAIRS_DIR="$STATE_DIR/paired_hosts"
+OLD_PAIRS="/data/adb/modules/sidewire/config/paired_hosts"
+mkdir -p "$STATE_DIR" "$PAIRS_DIR"
+chmod 0700 "$STATE_DIR" "$PAIRS_DIR" 2>/dev/null
+if [ -d "$OLD_PAIRS" ]; then
+  for old in "$OLD_PAIRS"/*.pair; do
+    [ -f "$old" ] || continue
+    dest="$PAIRS_DIR/${old##*/}"
+    [ -f "$dest" ] || cp "$old" "$dest" 2>/dev/null
+  done
+fi
+chmod 0600 "$PAIRS_DIR"/*.pair 2>/dev/null
 [ -n "$(ksud module config get mode 2>/dev/null)" ] || ksud module config set mode outbound >/dev/null 2>&1
 [ -n "$(ksud module config get port 2>/dev/null)" ] || ksud module config set port 58321 >/dev/null 2>&1
 [ -n "$(ksud module config get autostart 2>/dev/null)" ] || ksud module config set autostart 0 >/dev/null 2>&1

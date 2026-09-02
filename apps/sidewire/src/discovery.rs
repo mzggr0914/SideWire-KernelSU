@@ -74,13 +74,13 @@ pub(super) async fn run_discover(timeout_ms: u64) -> Result<()> {
     }
     println!("ID\tNAME\tENDPOINT\tPROTOCOL\tSECURITY\tSTATUS");
     for device in devices {
-        let compatible = device.protocol_version == sidewire_protocol::VERSION;
+        let compatible = sidewire_protocol::protocol_compatible(device.protocol_version);
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}",
             device.device_id.short(),
             device.name,
             device.endpoint,
-            device.protocol_version,
+            sidewire_protocol::protocol_label(device.protocol_version),
             device.security.as_str(),
             if compatible { "ready" } else { "mismatch" }
         );

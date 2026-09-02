@@ -2,9 +2,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sidewire_protocol::{
-    ExecExit, ExecIdentity, ExecRequest, FileMeta, FilePullRequest, FilePushRequest, FrameKind,
-    Hello, HelloAck, ProxyStartAck, ProxyStartRequest, ProxyTokenMode, PtyExit, PtyOpenAck,
-    PtyOpenRequest, PtyResize, decode, frame, raw_frame, read_frame, write_frame, write_raw_frame,
+    ClipboardData, ClipboardSetRequest, ExecExit, ExecIdentity, ExecRequest, FileMeta,
+    FilePullRequest, FilePushRequest, FrameKind, Hello, HelloAck, ProxyStartAck, ProxyStartRequest,
+    ProxyTokenMode, PtyExit, PtyOpenAck, PtyOpenRequest, PtyResize, decode, frame, raw_frame,
+    read_frame, write_frame, write_raw_frame,
 };
 #[cfg(windows)]
 use sidewire_protocol::{PtyCompleteRequest, PtyCompleteResult};
@@ -20,16 +21,16 @@ use std::{
 };
 use tokio::{
     fs::File,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::RwLock,
 };
 
 const DEFAULT_DEVICE_BIND: &str = "0.0.0.0:58321";
-const DEFAULT_CONTROL: &str = "127.0.0.1:58322";
 
 mod client;
 mod config;
+mod control;
 mod discovery;
 mod pairing;
 mod pty;
@@ -58,6 +59,9 @@ impl From<RunAs> for ExecIdentity {
 #[derive(Parser)]
 #[command(name = "sidewire", version, about = "SideWire desktop CLI")]
 struct Cli {
+    /// Override the local control IPC endpoint (named pipe on Windows, Unix socket on Unix).
+    #[arg(long, global = true, value_name = "PIPE|SOCKET")]
+    control: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -67,12 +71,10 @@ enum Command {
     Server {
         #[arg(long, default_value = DEFAULT_DEVICE_BIND)]
         bind: String,
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         /// Connect to an Android daemon running in inbound mode.
         #[arg(long = "connect", value_name = "HOST:PORT")]
         connect: Vec<String>,
-        /// Discover one inbound SideWire device on the local network.
+        /// Discover inbound SideWire devices on the local network.
         #[arg(long)]
         discover: bool,
         /// Disable authentication and encryption. Both sides must explicitly use insecure mode.
@@ -94,14 +96,10 @@ enum Command {
         timeout_ms: u64,
     },
     Doctor {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
     },
     WaitForDevice {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long, default_value_t = 30)]
@@ -111,13 +109,8 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    Devices {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
-    },
+    Devices {},
     Exec {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long)]
@@ -128,8 +121,6 @@ enum Command {
         args: Vec<String>,
     },
     Shell {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long = "as", value_enum)]
@@ -142,8 +133,6 @@ enum Command {
         probe: bool,
     },
     Push {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long)]
@@ -154,8 +143,6 @@ enum Command {
         remote: String,
     },
     Pull {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long = "as", value_enum)]
@@ -164,8 +151,6 @@ enum Command {
         local: PathBuf,
     },
     Install {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long = "as", value_enum)]
@@ -173,8 +158,6 @@ enum Command {
         apk: PathBuf,
     },
     Uninstall {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long = "as", value_enum)]
@@ -182,8 +165,6 @@ enum Command {
         package: String,
     },
     Logcat {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long = "as", value_enum)]
@@ -194,24 +175,18 @@ enum Command {
         args: Vec<String>,
     },
     Forward {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         local: String,
         remote: String,
     },
     Reverse {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         remote: String,
         local: String,
     },
     Reboot {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long = "as", value_enum)]
@@ -219,8 +194,6 @@ enum Command {
         target: Option<String>,
     },
     Screencap {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long = "as", value_enum)]
@@ -228,17 +201,19 @@ enum Command {
         output: PathBuf,
     },
     Packages {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long = "as", value_enum)]
         run_as: Option<RunAs>,
         filter: Option<String>,
     },
+    Clipboard {
+        #[arg(short = 's', long)]
+        device: Option<String>,
+        #[command(subcommand)]
+        command: ClipboardCommand,
+    },
     App {
-        #[arg(long, default_value = DEFAULT_CONTROL)]
-        control: String,
         #[arg(short = 's', long)]
         device: Option<String>,
         #[arg(long = "as", value_enum)]
@@ -256,6 +231,20 @@ enum ConfigCommand {
 }
 
 #[derive(Subcommand)]
+enum ClipboardCommand {
+    /// Print the Android clipboard text.
+    Get,
+    /// Set Android clipboard text directly.
+    Set { text: String },
+    /// Copy the current PC clipboard to Android.
+    Push,
+    /// Copy the current Android clipboard to the PC clipboard.
+    Pull,
+    /// Clear the Android clipboard.
+    Clear,
+}
+
+#[derive(Subcommand)]
 enum AppCommand {
     Start { package: String },
     Stop { package: String },
@@ -266,11 +255,11 @@ enum AppCommand {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let cli = Cli::parse();
+    let control = control::resolve_endpoint(cli.control)?;
     let app_config = config::load()?;
     match cli.command {
         Command::Server {
             bind,
-            control,
             mut connect,
             discover,
             insecure,
@@ -286,7 +275,7 @@ async fn main() -> Result<()> {
         Command::Paired => pairing::run_paired(),
         Command::Unpair { device } => pairing::run_unpair(device),
         Command::Discover { timeout_ms } => discovery::run_discover(timeout_ms).await,
-        Command::Doctor { control, device } => {
+        Command::Doctor { device } => {
             client::run_doctor(
                 &control,
                 config::resolve_device(&app_config, device),
@@ -294,11 +283,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::WaitForDevice {
-            control,
-            device,
-            timeout,
-        } => {
+        Command::WaitForDevice { device, timeout } => {
             client::run_wait_for_device(
                 &control,
                 config::resolve_device(&app_config, device),
@@ -311,9 +296,8 @@ async fn main() -> Result<()> {
             ConfigCommand::Set { key, value } => config::set(&key, &value),
             ConfigCommand::Unset { key } => config::unset(&key),
         },
-        Command::Devices { control } => client::run_devices(&control, &app_config).await,
+        Command::Devices {} => client::run_devices(&control, &app_config).await,
         Command::Exec {
-            control,
             device,
             all,
             run_as,
@@ -338,7 +322,6 @@ async fn main() -> Result<()> {
             }
         }
         Command::Shell {
-            control,
             device,
             run_as,
             raw,
@@ -354,7 +337,6 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Push {
-            control,
             device,
             all,
             run_as,
@@ -379,7 +361,6 @@ async fn main() -> Result<()> {
             }
         }
         Command::Pull {
-            control,
             device,
             run_as,
             remote,
@@ -395,7 +376,6 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Install {
-            control,
             device,
             run_as,
             apk,
@@ -409,7 +389,6 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Uninstall {
-            control,
             device,
             run_as,
             package,
@@ -424,7 +403,6 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Logcat {
-            control,
             device,
             run_as,
             clear,
@@ -440,7 +418,6 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Forward {
-            control,
             device,
             local,
             remote,
@@ -454,7 +431,6 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Reverse {
-            control,
             device,
             remote,
             local,
@@ -468,7 +444,6 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Reboot {
-            control,
             device,
             run_as,
             target,
@@ -482,7 +457,6 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Screencap {
-            control,
             device,
             run_as,
             output,
@@ -496,7 +470,6 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Packages {
-            control,
             device,
             run_as,
             filter,
@@ -509,8 +482,15 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Clipboard { device, command } => {
+            client::run_clipboard(
+                &control,
+                config::resolve_device(&app_config, device),
+                command,
+            )
+            .await
+        }
         Command::App {
-            control,
             device,
             run_as,
             command,

@@ -1,3 +1,4 @@
+pub mod capabilities;
 mod discovery;
 mod frame;
 mod messages;

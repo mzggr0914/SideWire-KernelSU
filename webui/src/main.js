@@ -17,7 +17,7 @@ app.innerHTML=`
 <section class="card"><div class="actions"><button id="start">Start</button><button id="restart">Restart</button><button class="danger" id="stop">Stop</button></div><p class="muted" id="status"></p></section>
 `;
 app.insertAdjacentHTML('beforeend',`
-<section class="card"><div class="card-title"><div><h3>Pairing</h3><div class="muted">Secure mode uses a one-time 6-digit PIN. Paired PCs reconnect automatically.</div></div><button class="small" id="refreshPaired">Refresh</button></div>
+<section class="card"><div class="card-title"><div><h3>Pairing</h3><div class="muted">Secure mode uses a one-time 6-digit PIN. Paired PCs reconnect automatically.</div></div><div class="actions"><button class="small" id="refreshPaired">Refresh</button><button class="small danger" id="removeAllPaired">Remove all</button></div></div>
 <div id="pinBox" class="pin-box hidden"><div class="muted">Pairing PIN</div><div class="pin" id="pin">------</div><div class="muted" id="pinTimer"></div></div>
 <p><button class="primary" id="pair">Generate pairing PIN</button></p><div id="paired"></div></section>
 <section class="card"><h3>Log</h3><pre id="log">Loading…</pre><button id="refresh">Refresh</button></section>
@@ -67,5 +67,6 @@ $('pair').onclick=async()=>{try{
   let left=60;$('pinTimer').textContent=`Expires in ${left}s`;clearInterval(pinTimer);pinTimer=setInterval(()=>{left--;if(left<=0){clearInterval(pinTimer);$('pinBox').classList.add('hidden')}else $('pinTimer').textContent=`Expires in ${left}s`;},1000);
   toast('Pairing enabled for 60 seconds');
 }catch(e){toast(e.message)}};
+$('removeAllPaired').onclick=async()=>{if(!confirm('Remove all paired PCs? They will need a new PIN to reconnect securely.'))return;try{await sh(`${ctl} unpair-all`);toast('All pairings removed');await refreshPaired()}catch(e){toast(e.message)}};
 $('start').onclick=()=>act('start');$('stop').onclick=()=>act('stop');$('restart').onclick=()=>act('restart');$('refresh').onclick=refresh;$('refreshPaired').onclick=refreshPaired;
 load();

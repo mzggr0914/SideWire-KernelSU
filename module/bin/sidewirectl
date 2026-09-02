@@ -1,17 +1,33 @@
 #!/system/bin/sh
 MODDIR=${0%/*}/..
 DAEMON="$MODDIR/bin/sidewired"
-CONFIG="$MODDIR/config/sidewire.conf"
-PIDFILE="$MODDIR/sidewired.pid"
-LOGFILE="$MODDIR/sidewired.log"
-PAIRING_FILE="$MODDIR/config/pairing"
-PAIRS_DIR="$MODDIR/config/paired_hosts"
+STATE_DIR="/data/adb/sidewire"
+CONFIG="$STATE_DIR/sidewire.conf"
+PIDFILE="$STATE_DIR/sidewired.pid"
+LOGFILE="$STATE_DIR/sidewired.log"
+PAIRING_FILE="$STATE_DIR/pairing"
+PAIRS_DIR="$STATE_DIR/paired_hosts"
+LEGACY_STATE="$MODDIR/config"
+CLIPBOARD_HELPER="$MODDIR/bin/sidewire-clipboard.jar"
 export KSU_MODULE=sidewire
+
+ensure_state(){
+  mkdir -p "$STATE_DIR" "$PAIRS_DIR"
+  chmod 0700 "$STATE_DIR" "$PAIRS_DIR" 2>/dev/null
+  if [ -d "$LEGACY_STATE/paired_hosts" ]; then
+    for old in "$LEGACY_STATE/paired_hosts"/*.pair; do
+      [ -f "$old" ] || continue
+      dest="$PAIRS_DIR/${old##*/}"
+      [ -f "$dest" ] || cp "$old" "$dest" 2>/dev/null
+    done
+  fi
+  chmod 0600 "$PAIRS_DIR"/*.pair 2>/dev/null
+}
 
 get(){ ksud module config get "$1" 2>/dev/null; }
 setv(){ ksud module config set "$1" "$2" >/dev/null; }
 write_config(){
-  mkdir -p "$MODDIR/config"
+  ensure_state
   mode="$(get mode)"; [ -n "$mode" ] || mode=outbound
   host="$(get host)"; [ -n "$host" ] || host=127.0.0.1
   port="$(get port)"; [ -n "$port" ] || port=58321
@@ -24,12 +40,11 @@ write_config(){
     [ -n "$device_id" ] || device_id="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
     setv device_id "$device_id"
   fi
-  mkdir -p "$PAIRS_DIR"
-  { echo "mode=$mode"; echo "host=$host"; echo "port=$port"; echo "name=$name"; echo "device_id=$device_id"; echo "security=$security"; echo "pairing_port=$pairing_port"; echo "pairing_file=$PAIRING_FILE"; echo "pairs_dir=$PAIRS_DIR"; } > "$CONFIG"
+  { echo "mode=$mode"; echo "host=$host"; echo "port=$port"; echo "name=$name"; echo "device_id=$device_id"; echo "security=$security"; echo "pairing_port=$pairing_port"; echo "pairing_file=$PAIRING_FILE"; echo "pairs_dir=$PAIRS_DIR"; echo "clipboard_helper=$CLIPBOARD_HELPER"; } > "$CONFIG"
   chmod 0600 "$CONFIG"
 }
 pair(){
-  mkdir -p "$MODDIR/config" "$PAIRS_DIR"
+  ensure_state
   raw="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')"
   [ -n "$raw" ] || raw="$(date +%s)"
   pin="$(printf '%06d' $((raw % 1000000)))"
@@ -39,7 +54,7 @@ pair(){
   echo "$pin"
 }
 paired(){
-  mkdir -p "$PAIRS_DIR"
+  ensure_state
   found=0
   for file in "$PAIRS_DIR"/*.pair; do
     [ -f "$file" ] || continue
@@ -51,6 +66,7 @@ paired(){
   [ "$found" -eq 1 ] || true
 }
 unpair(){
+  ensure_state
   id="$1"
   case "$id" in *[!0-9a-fA-F]*|'') echo "invalid host id" >&2; exit 2;; esac
   file="$PAIRS_DIR/$id.pair"
@@ -58,11 +74,16 @@ unpair(){
   rm -f "$file"
 }
 start_daemon(){
+  ensure_state
   [ -x "$DAEMON" ] || exit 1
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then exit 0; fi
   write_config
   "$DAEMON" --config "$CONFIG" >>"$LOGFILE" 2>&1 &
   echo $! > "$PIDFILE"
+}
+unpair_all(){
+  ensure_state
+  rm -f "$PAIRS_DIR"/*.pair "$PAIRING_FILE"
 }
 stop_daemon(){
   if [ -f "$PIDFILE" ]; then kill "$(cat "$PIDFILE")" 2>/dev/null; fi
@@ -88,6 +109,7 @@ case "$1" in
   pair) pair;;
   paired) paired;;
   unpair) unpair "$2";;
+  unpair-all) unpair_all;;
   log) tail -n 120 "$LOGFILE" 2>/dev/null;;
-  *) echo "usage: sidewirectl get|set|start|stop|restart|status|config|pair|paired|unpair|log"; exit 2;;
+  *) echo "usage: sidewirectl get|set|start|stop|restart|status|config|pair|paired|unpair|unpair-all|log"; exit 2;;
 esac

@@ -7,6 +7,7 @@ pub struct Hello {
     pub name: String,
     pub role: PeerRole,
     pub protocol_version: u16,
+    pub capabilities: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -21,6 +22,8 @@ pub struct HelloAck {
     pub name: String,
     pub os: String,
     pub arch: String,
+    pub protocol_version: u16,
+    pub capabilities: u64,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ExecIdentity {
@@ -123,4 +126,14 @@ pub struct PtyExit {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorMessage {
     pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClipboardSetRequest {
+    pub text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClipboardData {
+    pub text: Option<String>,
 }

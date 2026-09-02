@@ -37,6 +37,9 @@ if (-not $SkipWebUi) {
 }
 
 if (-not $SkipAndroid) {
+    Write-Host "==> Building Android clipboard helper"
+    & (Join-Path $PSScriptRoot "build-clipboard.ps1")
+    if ($LASTEXITCODE -ne 0) { throw "clipboard helper build failed" }
     Write-Host "==> Building Android daemon"
     $ndkCandidates = @(
         $env:ANDROID_NDK_HOME,

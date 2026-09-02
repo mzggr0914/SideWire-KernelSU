@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use sidewire_protocol::{
-    DeviceId, ExecExit, ExecIdentity, ExecRequest, FileMeta, FilePullRequest, FilePushRequest,
-    Frame, FrameKind, HelloAck, ProxyStartAck, ProxyStartRequest, ProxyTokenMode, PtyOpenRequest,
-    SecureFrameReader, SecureFrameWriter, SecurityMode, decode, frame,
+    ClipboardData, ClipboardSetRequest, DeviceId, ExecExit, ExecIdentity, ExecRequest, FileMeta,
+    FilePullRequest, FilePushRequest, Frame, FrameKind, HelloAck, ProxyStartAck, ProxyStartRequest,
+    ProxyTokenMode, PtyOpenRequest, SecureFrameReader, SecureFrameWriter, SecurityMode, decode,
+    frame,
 };
 #[cfg(target_os = "android")]
 use sidewire_protocol::{PtyCompleteRequest, PtyExit, PtyOpenAck, PtyResize};
@@ -21,6 +22,7 @@ use transport::MuxWriter;
 const FILE_BUFFER_SIZE: usize = 256 * 1024;
 const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 const STREAM_ROUTE_CAPACITY: usize = 16;
+const MAX_CLIPBOARD_TEXT: usize = 4 * 1024 * 1024;
 
 type StreamRoutes = Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Frame>>>>;
 
@@ -67,6 +69,7 @@ struct ResolvedConfig {
     pairing_file: Option<String>,
     pairs_dir: Option<String>,
     pairing_port: u16,
+    clipboard_helper: Option<String>,
 }
 
 fn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {
@@ -83,6 +86,7 @@ fn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {
     let mut pairing_file = None;
     let mut pairs_dir = None;
     let mut pairing_port = sidewire_protocol::PAIRING_PORT;
+    let mut clipboard_helper = None;
     if let Some(path) = &cli.config {
         let text = fs::read_to_string(path).with_context(|| format!("read config {path}"))?;
         for raw in text.lines() {
@@ -118,6 +122,7 @@ fn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {
                 "pairing_port" => {
                     pairing_port = value.parse().unwrap_or(sidewire_protocol::PAIRING_PORT)
                 }
+                "clipboard_helper" if !value.is_empty() => clipboard_helper = Some(value.into()),
                 _ => {}
             }
         }
@@ -146,6 +151,7 @@ fn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {
         pairing_file,
         pairs_dir,
         pairing_port,
+        clipboard_helper,
     })
 }
 
@@ -194,6 +200,7 @@ async fn main() -> Result<()> {
                 resolved.device_id,
                 resolved.security,
                 resolved.pairs_dir.clone(),
+                resolved.clipboard_helper.clone(),
             )
             .await
         }
@@ -204,6 +211,7 @@ async fn main() -> Result<()> {
                 resolved.device_id,
                 resolved.security,
                 resolved.pairs_dir.clone(),
+                resolved.clipboard_helper.clone(),
             )
             .await
         }
@@ -216,6 +224,7 @@ async fn run_inbound(
     device_id: DeviceId,
     security: SecurityMode,
     pairs_dir: Option<String>,
+    clipboard_helper: Option<String>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind)
         .await
@@ -235,9 +244,20 @@ async fn run_inbound(
         stream.set_nodelay(true).context("enable TCP_NODELAY")?;
         let name = name.to_owned();
         let pairs_dir = pairs_dir.clone();
+        let clipboard_helper = clipboard_helper.clone();
         tracing::info!(%peer, "host connected");
         tokio::spawn(async move {
-            if let Err(error) = serve(stream, &name, device_id, true, security, pairs_dir).await {
+            if let Err(error) = serve(
+                stream,
+                &name,
+                device_id,
+                true,
+                security,
+                pairs_dir,
+                clipboard_helper,
+            )
+            .await
+            {
                 tracing::warn!(%error, "connection ended");
             }
         });
@@ -277,6 +297,7 @@ async fn run_outbound(
     device_id: DeviceId,
     security: SecurityMode,
     pairs_dir: Option<String>,
+    clipboard_helper: Option<String>,
 ) -> Result<()> {
     let mut delay = 1u64;
     loop {
@@ -284,8 +305,16 @@ async fn run_outbound(
             Ok(stream) => {
                 stream.set_nodelay(true).context("enable TCP_NODELAY")?;
                 tracing::info!(%server, "connected to SideWire host");
-                if let Err(error) =
-                    serve(stream, name, device_id, false, security, pairs_dir.clone()).await
+                if let Err(error) = serve(
+                    stream,
+                    name,
+                    device_id,
+                    false,
+                    security,
+                    pairs_dir.clone(),
+                    clipboard_helper.clone(),
+                )
+                .await
                 {
                     tracing::warn!(%error, "host connection ended");
                 }
@@ -315,6 +344,16 @@ async fn unregister_stream(routes: &StreamRoutes, stream_id: u32) {
     routes.lock().await.remove(&stream_id);
 }
 
+fn daemon_capabilities(clipboard_helper: Option<&str>) -> u64 {
+    let mut capabilities = sidewire_protocol::capabilities::CORE
+        | sidewire_protocol::capabilities::PTY_COMPLETION
+        | sidewire_protocol::capabilities::SECURE_PROXY;
+    if clipboard_helper.is_some_and(|path| std::path::Path::new(path).is_file()) {
+        capabilities |= sidewire_protocol::capabilities::CLIPBOARD;
+    }
+    capabilities
+}
+
 async fn serve(
     mut stream: TcpStream,
     name: &str,
@@ -322,7 +361,9 @@ async fn serve(
     inbound: bool,
     security_mode: SecurityMode,
     pairs_dir: Option<String>,
+    clipboard_helper: Option<String>,
 ) -> Result<()> {
+    let local_capabilities = daemon_capabilities(clipboard_helper.as_deref());
     let secured = if inbound {
         security::accept_connection(&mut stream, device_id, security_mode, pairs_dir.as_deref())
             .await?
@@ -341,14 +382,28 @@ async fn serve(
             bail!("expected host Hello");
         }
         let hello: sidewire_protocol::Hello = decode(&hello_frame.payload)?;
+        if !sidewire_protocol::protocol_compatible(hello.protocol_version) {
+            bail!("host protocol major is incompatible");
+        }
+        if hello.capabilities & sidewire_protocol::capabilities::CORE == 0 {
+            bail!("host does not advertise the core capability");
+        }
         tracing::info!(peer = %hello.name, host_id = %secured.peer_id.short(), security = security_mode.as_str(), "handshake complete");
-        send_ack(&mut stream, name, device_id, noise.clone()).await?;
+        send_ack(
+            &mut stream,
+            name,
+            device_id,
+            noise.clone(),
+            local_capabilities,
+        )
+        .await?;
     } else {
         let hello = sidewire_protocol::Hello {
             device_id: Some(device_id),
             name: name.to_owned(),
             role: sidewire_protocol::PeerRole::Device,
             protocol_version: sidewire_protocol::VERSION,
+            capabilities: local_capabilities,
         };
         {
             let mut writer = SecureFrameWriter::new(&mut stream, noise.clone());
@@ -362,6 +417,13 @@ async fn serve(
         };
         if ack.kind != FrameKind::HelloAck {
             bail!("expected host HelloAck");
+        }
+        let ack: HelloAck = decode(&ack.payload)?;
+        if !sidewire_protocol::protocol_compatible(ack.protocol_version) {
+            bail!("host protocol major is incompatible");
+        }
+        if ack.capabilities & sidewire_protocol::capabilities::CORE == 0 {
+            bail!("host does not advertise the core capability");
         }
     }
 
@@ -432,6 +494,76 @@ async fn serve(
                         }
                     });
                 }
+                FrameKind::ClipboardGet => {
+                    let writer = writer.clone();
+                    let helper = clipboard_helper.clone();
+                    tokio::spawn(async move {
+                        let result: Result<()> = async {
+                            let helper =
+                                helper.context("clipboard helper is unavailable on this device")?;
+                            let text = run_clipboard_helper(&helper, "get", None).await?;
+                            writer
+                                .send(&frame(
+                                    FrameKind::ClipboardData,
+                                    stream_id,
+                                    &ClipboardData { text: Some(text) },
+                                )?)
+                                .await
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            writer.send_error(stream_id, error).await;
+                        }
+                    });
+                }
+                FrameKind::ClipboardSet => {
+                    let writer = writer.clone();
+                    let helper = clipboard_helper.clone();
+                    tokio::spawn(async move {
+                        let result: Result<()> = async {
+                            let helper =
+                                helper.context("clipboard helper is unavailable on this device")?;
+                            let request: ClipboardSetRequest = decode(&request.payload)?;
+                            if request.text.len() > MAX_CLIPBOARD_TEXT {
+                                bail!("clipboard text exceeds 4 MiB limit");
+                            }
+                            run_clipboard_helper(&helper, "set", Some(&request.text)).await?;
+                            writer
+                                .send(&frame(
+                                    FrameKind::ClipboardData,
+                                    stream_id,
+                                    &ClipboardData { text: None },
+                                )?)
+                                .await
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            writer.send_error(stream_id, error).await;
+                        }
+                    });
+                }
+                FrameKind::ClipboardClear => {
+                    let writer = writer.clone();
+                    let helper = clipboard_helper.clone();
+                    tokio::spawn(async move {
+                        let result: Result<()> = async {
+                            let helper =
+                                helper.context("clipboard helper is unavailable on this device")?;
+                            run_clipboard_helper(&helper, "clear", None).await?;
+                            writer
+                                .send(&frame(
+                                    FrameKind::ClipboardData,
+                                    stream_id,
+                                    &ClipboardData { text: None },
+                                )?)
+                                .await
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            writer.send_error(stream_id, error).await;
+                        }
+                    });
+                }
                 FrameKind::ProxyStartRequest => {
                     let writer = writer.clone();
                     let proxies = proxies.clone();
@@ -478,17 +610,61 @@ async fn send_ack(
     name: &str,
     device_id: DeviceId,
     noise: Option<sidewire_protocol::SharedNoise>,
+    capabilities: u64,
 ) -> Result<()> {
     let ack = HelloAck {
         device_id: Some(device_id),
         name: name.to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
+        protocol_version: sidewire_protocol::VERSION,
+        capabilities,
     };
     let mut writer = SecureFrameWriter::new(stream, noise);
     writer
         .write_frame(&frame(FrameKind::HelloAck, 0, &ack)?)
         .await
+}
+
+async fn run_clipboard_helper(
+    helper: &str,
+    operation: &str,
+    input: Option<&str>,
+) -> Result<String> {
+    if !std::path::Path::new(helper).is_file() {
+        bail!("clipboard helper not found at {helper}");
+    }
+    let mut command = Command::new("/system/bin/app_process");
+    command
+        .arg("/system/bin")
+        .arg("com.sidewire.ClipboardHelper")
+        .arg(operation)
+        .env("CLASSPATH", helper)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_identity(&mut command, ExecIdentity::Shell)?;
+    let mut child = command.spawn().context("start Android clipboard helper")?;
+    if let Some(text) = input {
+        let mut stdin = child.stdin.take().context("open clipboard helper stdin")?;
+        stdin.write_all(text.as_bytes()).await?;
+        stdin.shutdown().await?;
+    }
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        bail!(
+            "Android clipboard helper failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    if output.stdout.len() > MAX_CLIPBOARD_TEXT {
+        bail!("Android clipboard text exceeds 4 MiB limit");
+    }
+    String::from_utf8(output.stdout).context("Android clipboard is not valid UTF-8")
 }
 
 #[cfg(target_os = "android")]

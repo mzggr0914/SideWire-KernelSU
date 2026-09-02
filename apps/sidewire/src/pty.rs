@@ -267,10 +267,7 @@ pub(super) async fn run_pty_client(
         term: "xterm-256color".into(),
         echo: true,
     };
-    let mut stream = TcpStream::connect(control)
-        .await
-        .with_context(|| format!("connect to SideWire server control {control}"))?;
-    stream.set_nodelay(true).context("enable TCP_NODELAY")?;
+    let mut stream = crate::control::connect(control).await?;
     let mut encoded = serde_json::to_vec(&request)?;
     encoded.push(b'\n');
     stream.write_all(&encoded).await?;
@@ -710,7 +707,7 @@ async fn open_pty_control(
     program: String,
     args: Vec<String>,
     echo: bool,
-) -> Result<BufReader<TcpStream>> {
+) -> Result<BufReader<crate::control::ControlStream>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let request = ControlRequest::Pty {
         device,
@@ -722,10 +719,7 @@ async fn open_pty_control(
         term: "xterm-256color".into(),
         echo,
     };
-    let mut stream = TcpStream::connect(control)
-        .await
-        .with_context(|| format!("connect to SideWire server control {control}"))?;
-    stream.set_nodelay(true).context("enable TCP_NODELAY")?;
+    let mut stream = crate::control::connect(control).await?;
     let mut encoded = serde_json::to_vec(&request)?;
     encoded.push(b'\n');
     stream.write_all(&encoded).await?;

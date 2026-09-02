@@ -4,7 +4,36 @@ use std::io::IoSlice;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAGIC: [u8; 4] = *b"SIDE";
-pub const VERSION: u16 = 9;
+pub const PROTOCOL_MAJOR: u8 = 1;
+pub const PROTOCOL_MINOR: u8 = 0;
+pub const VERSION: u16 = ((PROTOCOL_MAJOR as u16) << 8) | PROTOCOL_MINOR as u16;
+
+pub const fn protocol_major(version: u16) -> u8 {
+    (version >> 8) as u8
+}
+pub const fn protocol_minor(version: u16) -> u8 {
+    version as u8
+}
+pub const fn protocol_compatible(version: u16) -> bool {
+    protocol_major(version) == PROTOCOL_MAJOR
+}
+pub const fn negotiated_version(peer: u16) -> Option<u16> {
+    if protocol_compatible(peer) {
+        Some(
+            ((PROTOCOL_MAJOR as u16) << 8)
+                | (if PROTOCOL_MINOR < protocol_minor(peer) {
+                    PROTOCOL_MINOR
+                } else {
+                    protocol_minor(peer)
+                }) as u16,
+        )
+    } else {
+        None
+    }
+}
+pub fn protocol_label(version: u16) -> String {
+    format!("{}.{}", protocol_major(version), protocol_minor(version))
+}
 pub const HEADER_LEN: usize = 16;
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
@@ -33,6 +62,10 @@ pub enum FrameKind {
     PtyClose = 56,
     PtyComplete = 57,
     PtyCompleteResult = 58,
+    ClipboardGet = 60,
+    ClipboardSet = 61,
+    ClipboardClear = 62,
+    ClipboardData = 63,
     Ping = 20,
     Pong = 21,
     Error = 255,
@@ -65,6 +98,10 @@ impl TryFrom<u16> for FrameKind {
             56 => Self::PtyClose,
             57 => Self::PtyComplete,
             58 => Self::PtyCompleteResult,
+            60 => Self::ClipboardGet,
+            61 => Self::ClipboardSet,
+            62 => Self::ClipboardClear,
+            63 => Self::ClipboardData,
             20 => Self::Ping,
             21 => Self::Pong,
             255 => Self::Error,
@@ -118,8 +155,8 @@ pub fn decode_frame_bytes(bytes: &[u8]) -> Result<Frame> {
         bail!("invalid SideWire frame magic");
     }
     let version = u16::from_be_bytes([header[4], header[5]]);
-    if version != VERSION {
-        bail!("unsupported protocol version {version}");
+    if !protocol_compatible(version) {
+        bail!("unsupported protocol version {}", protocol_label(version));
     }
     let kind = FrameKind::try_from(u16::from_be_bytes([header[6], header[7]]))?;
     let stream_id = u32::from_be_bytes(header[8..12].try_into().unwrap());
@@ -181,8 +218,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
         bail!("invalid SideWire frame magic");
     }
     let version = u16::from_be_bytes([header[4], header[5]]);
-    if version != VERSION {
-        bail!("unsupported protocol version {version}");
+    if !protocol_compatible(version) {
+        bail!("unsupported protocol version {}", protocol_label(version));
     }
     let kind = FrameKind::try_from(u16::from_be_bytes([header[6], header[7]]))?;
     let stream_id = u32::from_be_bytes(header[8..12].try_into().unwrap());
@@ -217,7 +254,22 @@ pub fn raw_frame(kind: FrameKind, stream_id: u32, payload: Vec<u8>) -> Frame {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameKind, read_frame, write_raw_frame};
+    use super::{
+        FrameKind, PROTOCOL_MAJOR, PROTOCOL_MINOR, VERSION, negotiated_version,
+        protocol_compatible, protocol_label, read_frame, write_raw_frame,
+    };
+
+    #[test]
+    fn protocol_negotiates_within_major_only() {
+        let newer_minor =
+            ((PROTOCOL_MAJOR as u16) << 8) | (PROTOCOL_MINOR.saturating_add(3) as u16);
+        assert!(protocol_compatible(newer_minor));
+        assert_eq!(negotiated_version(newer_minor), Some(VERSION));
+        let next_major = ((PROTOCOL_MAJOR + 1) as u16) << 8;
+        assert!(!protocol_compatible(next_major));
+        assert_eq!(negotiated_version(next_major), None);
+        assert_eq!(protocol_label(VERSION), "1.0");
+    }
 
     #[tokio::test]
     async fn vectored_writer_round_trips_payload() {

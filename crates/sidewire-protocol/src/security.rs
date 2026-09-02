@@ -60,6 +60,7 @@ pub struct PairBanner {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairStart {
+    pub protocol_version: u16,
     pub host_id: crate::DeviceId,
     pub host_name: String,
     pub spake_message: Vec<u8>,
@@ -284,10 +285,14 @@ impl<W: AsyncWrite + Unpin> SecureFrameWriter<W> {
     }
 }
 
-pub fn security_prologue(initiator: crate::DeviceId, responder: crate::DeviceId) -> Vec<u8> {
+pub fn security_prologue(
+    version: u16,
+    initiator: crate::DeviceId,
+    responder: crate::DeviceId,
+) -> Vec<u8> {
     format!(
         "SideWire/v{}/{}->{}",
-        crate::VERSION,
+        version,
         initiator.to_hex(),
         responder.to_hex()
     )

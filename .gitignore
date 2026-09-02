@@ -11,3 +11,5 @@
 .idea/
 .vscode/
 module/bin/sidewired
+
+module/bin/sidewire-clipboard.jar
