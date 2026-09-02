@@ -30,7 +30,8 @@ let pinTimer=null;
 async function sh(cmd){const r=await exec(cmd);if(r.errno!==0)throw new Error(r.stderr||`errno ${r.errno}`);return (r.stdout||'').trim();}
 async function get(k,f=''){try{return await sh(`${ctl} get ${k}`)||f}catch{return f}}
 function renderSecurity(){const insecure=$('security').value==='insecure';$('insecureWarning').classList.toggle('hidden',!insecure);}
-async function refresh(){const st=await sh(`${ctl} status`).catch(e=>`error: ${e.message}`);$('status').textContent=st;$('state').textContent=st.startsWith('running')?'running':'stopped';const log=await sh(`${ctl} log`).catch(e=>e.message);$('log').textContent=log||'No log yet.';}
+function stripAnsi(text){return text.replace(/\x1B\[[0-?]*[ -\/]*[@-~]/g,'');}
+async function refresh(){const st=await sh(`${ctl} status`).catch(e=>`error: ${e.message}`);$('status').textContent=st;$('state').textContent=st.startsWith('running')?'running':'stopped';const log=stripAnsi(await sh(`${ctl} log`).catch(e=>e.message));$('log').textContent=log||'No log yet.';}
 async function refreshPaired(){
   const text=await sh(`${ctl} paired`).catch(()=>"");
   const rows=text?text.split('\n').filter(Boolean):[];

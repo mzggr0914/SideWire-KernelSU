@@ -1,6 +1,6 @@
 id=sidewire
 name=SideWire
-version=0.9.1
-versionCode=19
+version=0.9.2
+versionCode=20
 author=SideWire contributors
 description=Secure native Android bridge with PTY, clipboard, file transfer, multi-device control, app tools, and TCP forwarding.
