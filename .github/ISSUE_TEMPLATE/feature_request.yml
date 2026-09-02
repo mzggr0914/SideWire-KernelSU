@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest a focused SideWire improvement
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      placeholder: Keep it concrete — command, workflow, or expected result.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives / notes
+      description: Optional. Mention existing tools or workarounds if relevant.

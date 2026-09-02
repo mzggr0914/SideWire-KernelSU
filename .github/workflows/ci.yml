@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  webui:
+    name: WebUI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/setup@v2
+        with:
+          version: 11
+          runtime: node@24
+      - name: Install
+        run: pnpm install --frozen-lockfile
+        working-directory: webui
+      - name: Build
+        run: pnpm build
+        working-directory: webui
+
+  android:
+    name: Android arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+      - name: Rust Android tooling
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --locked
+      - name: Android clippy
+        run: cargo ndk -t arm64-v8a -P 23 clippy -p sidewired -- -D warnings
+      - name: Module shell syntax
+        run: |
+          sh -n module/bin/sidewirectl
+          sh -n module/customize.sh
+          sh -n module/service.sh

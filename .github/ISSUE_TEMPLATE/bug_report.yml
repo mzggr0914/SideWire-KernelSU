@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible SideWire problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      placeholder: Tell us what you expected and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: SideWire version
+      placeholder: 0.9.4
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: Android/ROM, KernelSU version, Windows or Linux
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps / logs
+      description: Remove pairing secrets or other credentials before posting logs.
+    validations:
+      required: true
