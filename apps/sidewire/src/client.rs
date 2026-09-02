@@ -304,20 +304,20 @@ pub(super) async fn run_exec_client(
         _ => bail!("unexpected exec stream response"),
     }
 
-    let mut stdout = io::stdout();
-    let mut stderr = io::stderr();
+    let mut stdout = crate::console_output::StreamOutput::stdout();
+    let mut stderr = crate::console_output::StreamOutput::stderr();
     loop {
         let incoming = read_frame(&mut reader).await?;
         match incoming.kind {
             FrameKind::ExecStdout => {
-                stdout.write_all(&incoming.payload)?;
-                stdout.flush()?;
+                stdout.write_chunk(&incoming.payload)?;
             }
             FrameKind::ExecStderr => {
-                stderr.write_all(&incoming.payload)?;
-                stderr.flush()?;
+                stderr.write_chunk(&incoming.payload)?;
             }
             FrameKind::ExecExit => {
+                stdout.finish()?;
+                stderr.finish()?;
                 let exit: ExecExit = decode(&incoming.payload)?;
                 if exit.code.unwrap_or(1) != 0 {
                     bail!("remote exit code {:?}", exit.code);

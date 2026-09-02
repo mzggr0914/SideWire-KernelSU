@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.9.7
+
+- keep Windows logcat/PTY/exec streaming alive across invalid or split UTF-8 bytes
+- preserve raw stream bytes when stdout/stderr are redirected instead of attached to a Windows console
+
 ## 0.9.6
 
 - detached WebUI-started Android daemon from the manager app cgroup via KernelSU module actions

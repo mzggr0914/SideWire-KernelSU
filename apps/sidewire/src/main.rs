@@ -30,6 +30,7 @@ const DEFAULT_DEVICE_BIND: &str = "0.0.0.0:58321";
 
 mod client;
 mod config;
+mod console_output;
 mod control;
 mod discovery;
 mod pairing;

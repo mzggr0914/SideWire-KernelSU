@@ -291,7 +291,7 @@ pub(super) async fn run_pty_client(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_console_reader(stop.clone(), event_tx);
     let stream_id = 0x5054_5901;
-    let mut stdout = io::stdout();
+    let mut stdout = crate::console_output::StreamOutput::stdout();
     let (mut net_read, mut net_write) = tokio::io::split(reader);
     let input_loop = async {
         const RAW_BATCH_BYTES: usize = 4 * 1024;
@@ -347,10 +347,10 @@ pub(super) async fn run_pty_client(
             match remote.kind {
                 FrameKind::PtyOutput => {
                     saw_output = true;
-                    stdout.write_all(&remote.payload)?;
-                    stdout.flush()?;
+                    stdout.write_chunk(&remote.payload)?;
                 }
                 FrameKind::PtyExit => {
+                    stdout.finish()?;
                     let exit: PtyExit = decode(&remote.payload)?;
                     if !saw_output || exit.code.unwrap_or(0) != 0 {
                         bail!("remote PTY exited (code {:?})", exit.code);
@@ -765,7 +765,7 @@ async fn run_pty_line_client(
             }
         }
     });
-    let mut stdout = io::stdout();
+    let mut stdout = crate::console_output::StreamOutput::stdout();
     let mut completion_reply: Option<std::sync::mpsc::SyncSender<Option<PtyCompleteResult>>> = None;
     let result = loop {
         tokio::select! {
@@ -807,8 +807,7 @@ async fn run_pty_line_client(
                 Some(Ok(frame)) => match frame.kind {
                     FrameKind::PtyOutput => {
                         update_prompt_tail(&display, &frame.payload);
-                        stdout.write_all(&frame.payload)?;
-                        stdout.flush()?;
+                        stdout.write_chunk(&frame.payload)?;
                     }
                     FrameKind::PtyCompleteResult => {
                         let completion: PtyCompleteResult = decode(&frame.payload)?;
@@ -816,7 +815,10 @@ async fn run_pty_line_client(
                             let _ = reply.send(Some(completion));
                         }
                     }
-                    FrameKind::PtyExit => break Ok(()),
+                    FrameKind::PtyExit => {
+                        stdout.finish()?;
+                        break Ok(());
+                    }
                     FrameKind::Error => break Err(anyhow::anyhow!("remote PTY error: {}", String::from_utf8_lossy(&frame.payload))),
                     kind => break Err(anyhow::anyhow!("unexpected PTY frame {kind:?}")),
                 },
@@ -850,16 +852,19 @@ async fn run_pty_probe(control: &str, device: Option<String>, run_as: RunAs) -> 
     )
     .await?;
     let probe = async {
+        let mut stdout = crate::console_output::StreamOutput::stdout();
         let mut output = Vec::new();
         loop {
             let frame = read_frame(&mut stream).await?;
             match frame.kind {
                 FrameKind::PtyOutput => {
-                    io::stdout().write_all(&frame.payload)?;
-                    io::stdout().flush()?;
+                    stdout.write_chunk(&frame.payload)?;
                     output.extend_from_slice(&frame.payload);
                 }
-                FrameKind::PtyExit => break,
+                FrameKind::PtyExit => {
+                    stdout.finish()?;
+                    break;
+                }
                 FrameKind::Error => bail!(
                     "remote PTY error: {}",
                     String::from_utf8_lossy(&frame.payload)
