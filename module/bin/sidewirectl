@@ -6,6 +6,7 @@ CONFIG="$STATE_DIR/sidewire.conf"
 PIDFILE="$STATE_DIR/sidewired.pid"
 LOGFILE="$STATE_DIR/sidewired.log"
 PAIRING_FILE="$STATE_DIR/pairing"
+ACTION_FILE="$STATE_DIR/action"
 PAIRS_DIR="$STATE_DIR/paired_hosts"
 LEGACY_STATE="$MODDIR/config"
 LEGACY_PIDFILE="$MODDIR/sidewired.pid"
@@ -110,6 +111,13 @@ unpair(){
   [ -f "$file" ] || { echo "paired host not found" >&2; exit 1; }
   rm -f "$file"
 }
+request_action(){
+  ensure_state
+  printf '%s\n' "$1" > "$ACTION_FILE" || return 1
+  chmod 0600 "$ACTION_FILE"
+  ksud module action sidewire
+}
+
 start_daemon(){
   ensure_state
   [ -x "$DAEMON" ] || exit 1
@@ -146,9 +154,12 @@ status(){
 case "$1" in
   get) get "$2";;
   set) setv "$2" "$3"; write_config;;
-  start) start_daemon;;
-  stop) stop_daemon;;
-  restart) stop_daemon; sleep 1; start_daemon;;
+  start) request_action start;;
+  stop) request_action stop;;
+  restart) request_action restart;;
+  _start) start_daemon;;
+  _stop) stop_daemon;;
+  _restart) stop_daemon; sleep 1; start_daemon;;
   status) status;;
   config) write_config; cat "$CONFIG";;
   pair) pair;;

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.9.6
+
+- detached WebUI-started Android daemon from the manager app cgroup via KernelSU module actions
+- kept boot autostart on the direct KernelSU service path
+
 ## 0.9.5
 
 - added negotiated connection heartbeats and faster outbound reconnects
