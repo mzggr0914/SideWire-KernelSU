@@ -5,7 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAGIC: [u8; 4] = *b"SIDE";
 pub const PROTOCOL_MAJOR: u8 = 1;
-pub const PROTOCOL_MINOR: u8 = 0;
+pub const PROTOCOL_MINOR: u8 = 1;
 pub const VERSION: u16 = ((PROTOCOL_MAJOR as u16) << 8) | PROTOCOL_MINOR as u16;
 
 pub const fn protocol_major(version: u16) -> u8 {
@@ -68,6 +68,7 @@ pub enum FrameKind {
     ClipboardData = 63,
     Ping = 20,
     Pong = 21,
+    StreamCancel = 22,
     Error = 255,
 }
 
@@ -104,6 +105,7 @@ impl TryFrom<u16> for FrameKind {
             63 => Self::ClipboardData,
             20 => Self::Ping,
             21 => Self::Pong,
+            22 => Self::StreamCancel,
             255 => Self::Error,
             other => bail!("unknown frame kind {other}"),
         })
@@ -261,6 +263,10 @@ mod tests {
 
     #[test]
     fn protocol_negotiates_within_major_only() {
+        let older_minor = (PROTOCOL_MAJOR as u16) << 8;
+        assert!(protocol_compatible(older_minor));
+        assert_eq!(negotiated_version(older_minor), Some(older_minor));
+
         let newer_minor =
             ((PROTOCOL_MAJOR as u16) << 8) | (PROTOCOL_MINOR.saturating_add(3) as u16);
         assert!(protocol_compatible(newer_minor));
@@ -268,7 +274,7 @@ mod tests {
         let next_major = ((PROTOCOL_MAJOR + 1) as u16) << 8;
         assert!(!protocol_compatible(next_major));
         assert_eq!(negotiated_version(next_major), None);
-        assert_eq!(protocol_label(VERSION), "1.0");
+        assert_eq!(protocol_label(VERSION), "1.1");
     }
 
     #[tokio::test]

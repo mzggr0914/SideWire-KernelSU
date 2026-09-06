@@ -1,5 +1,5 @@
 #!/system/bin/sh
-ui_print "- SideWire 0.9.7"
+ui_print "- SideWire 0.9.8"
 ui_print "- Root/shell execution + KernelSU WebUI"
 [ "$ARCH" = "arm64" ] || abort "SideWire currently supports arm64 only"
 set_perm "$MODPATH/bin/sidewired" 0 0 0755

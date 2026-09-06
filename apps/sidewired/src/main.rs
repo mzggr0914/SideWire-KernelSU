@@ -22,6 +22,8 @@ use transport::MuxWriter;
 const FILE_BUFFER_SIZE: usize = 256 * 1024;
 const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 const STREAM_ROUTE_CAPACITY: usize = 16;
+const HOST_SILENCE_TIMEOUT_SECS: u64 = 45;
+const STREAM_CANCEL_PROTOCOL_MINOR: u8 = 1;
 const MAX_CLIPBOARD_TEXT: usize = 4 * 1024 * 1024;
 
 type StreamRoutes = Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Frame>>>>;
@@ -369,7 +371,8 @@ fn daemon_capabilities(clipboard_helper: Option<&str>) -> u64 {
     let mut capabilities = sidewire_protocol::capabilities::CORE
         | sidewire_protocol::capabilities::PTY_COMPLETION
         | sidewire_protocol::capabilities::SECURE_PROXY
-        | sidewire_protocol::capabilities::HEARTBEAT;
+        | sidewire_protocol::capabilities::HEARTBEAT
+        | sidewire_protocol::capabilities::STREAM_CANCEL;
     if clipboard_helper.is_some_and(|path| std::path::Path::new(path).is_file()) {
         capabilities |= sidewire_protocol::capabilities::CLIPBOARD;
     }
@@ -395,7 +398,7 @@ async fn serve(
     };
     let noise = secured.noise.clone();
     let shared_secret = secured.shared_secret;
-    let peer_capabilities = if inbound {
+    let (peer_capabilities, negotiated_protocol) = if inbound {
         let hello_frame = {
             let mut reader = SecureFrameReader::new(&mut stream, noise.clone());
             reader.read_frame().await?
@@ -404,9 +407,8 @@ async fn serve(
             bail!("expected host Hello");
         }
         let hello: sidewire_protocol::Hello = decode(&hello_frame.payload)?;
-        if !sidewire_protocol::protocol_compatible(hello.protocol_version) {
-            bail!("host protocol major is incompatible");
-        }
+        let protocol = sidewire_protocol::negotiated_version(hello.protocol_version)
+            .context("host protocol major is incompatible")?;
         if hello.capabilities & sidewire_protocol::capabilities::CORE == 0 {
             bail!("host does not advertise the core capability");
         }
@@ -419,7 +421,7 @@ async fn serve(
             local_capabilities,
         )
         .await?;
-        hello.capabilities
+        (hello.capabilities, protocol)
     } else {
         let hello = sidewire_protocol::Hello {
             device_id: Some(device_id),
@@ -442,19 +444,21 @@ async fn serve(
             bail!("expected host HelloAck");
         }
         let ack: HelloAck = decode(&ack.payload)?;
-        if !sidewire_protocol::protocol_compatible(ack.protocol_version) {
-            bail!("host protocol major is incompatible");
-        }
+        let protocol = sidewire_protocol::negotiated_version(ack.protocol_version)
+            .context("host protocol major is incompatible")?;
         if ack.capabilities & sidewire_protocol::capabilities::CORE == 0 {
             bail!("host does not advertise the core capability");
         }
-        ack.capabilities
+        (ack.capabilities, protocol)
     };
     let negotiated_capabilities = local_capabilities & peer_capabilities;
+    let supports_stream_cancel = sidewire_protocol::protocol_minor(negotiated_protocol)
+        >= STREAM_CANCEL_PROTOCOL_MINOR
+        && negotiated_capabilities & sidewire_protocol::capabilities::STREAM_CANCEL != 0;
 
     let (reader_half, writer_half) = stream.into_split();
     let mut reader = SecureFrameReader::new(reader_half, noise.clone());
-    let writer = MuxWriter::new(writer_half, noise);
+    let writer = MuxWriter::new(writer_half, noise, supports_stream_cancel);
     let routes: StreamRoutes = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let proxies = Arc::new(tokio::sync::Mutex::new(HashMap::<
         String,
@@ -465,23 +469,47 @@ async fn serve(
     let result: Result<()> = async {
         loop {
             let request = if heartbeat {
-                match tokio::time::timeout(Duration::from_secs(30), reader.read_frame()).await {
+                match tokio::time::timeout(
+                    Duration::from_secs(HOST_SILENCE_TIMEOUT_SECS),
+                    reader.read_frame(),
+                )
+                .await
+                {
                     Ok(result) => result?,
                     Err(_) => bail!("host heartbeat timeout"),
                 }
             } else {
                 reader.read_frame().await?
             };
-            let routed = { routes.lock().await.get(&request.stream_id).cloned() };
+            let stream_id = request.stream_id;
+            if request.kind == FrameKind::StreamCancel {
+                writer.cancel_local(stream_id);
+                let removed = routes.lock().await.remove(&stream_id).is_some();
+                tracing::debug!(stream_id, routed = removed, "host canceled device stream");
+                continue;
+            }
+
+            let routed = { routes.lock().await.get(&stream_id).cloned() };
             if let Some(sender) = routed {
-                let stream_id = request.stream_id;
-                if sender.send(request).await.is_err() {
-                    unregister_stream(&routes, stream_id).await;
+                match sender.try_send(request) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        routes.lock().await.remove(&stream_id);
+                        let reason =
+                            format!("stream {stream_id} receive queue overflow; stream canceled");
+                        tracing::warn!(stream_id, "host stream receive queue overflow");
+                        let writer = writer.clone();
+                        tokio::spawn(async move {
+                            writer.send_cancel(stream_id, reason).await;
+                        });
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        routes.lock().await.remove(&stream_id);
+                    }
                 }
                 continue;
             }
 
-            let stream_id = request.stream_id;
             match request.kind {
                 FrameKind::ExecRequest => {
                     let writer = writer.clone();
@@ -758,7 +786,8 @@ async fn handle_exec(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Resu
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
     }
@@ -886,18 +915,37 @@ async fn handle_push(
 
     let mut command = identity_command(
         request.identity,
-        "exec /system/bin/cat > \"$1\"",
+        "exec 3>\"$1\" || exit $?; printf R; exec /system/bin/cat >&3",
         &request.path,
     )
     .await?;
     command
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let mut child = command
         .spawn()
         .with_context(|| format!("create {}", request.path))?;
     let mut child_stdin = child.stdin.take().context("push child stdin unavailable")?;
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .context("push child stdout unavailable")?;
+    let mut ready = [0u8; 1];
+    let readiness = child_stdout.read_exact(&mut ready).await;
+    drop(child_stdout);
+    if readiness.is_err() || ready[0] != b'R' {
+        drop(child_stdin);
+        let output = child.wait_with_output().await?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if !stderr.is_empty() {
+            bail!("write {}: {stderr}", request.path);
+        }
+        readiness.with_context(|| format!("open {} for push", request.path))?;
+        bail!("open {} for push did not become ready", request.path);
+    }
     writer
         .send(&frame(
             FrameKind::FileMeta,
@@ -905,29 +953,38 @@ async fn handle_push(
             &FileMeta { size: 0 },
         )?)
         .await?;
-    loop {
-        let incoming = inbox
-            .recv()
-            .await
-            .context("device connection closed during push")?;
-        if incoming.stream_id != stream_id {
-            bail!("unexpected stream {} during push", incoming.stream_id);
+
+    let transfer_result: Result<()> = async {
+        loop {
+            let incoming = inbox
+                .recv()
+                .await
+                .context("device connection closed during push")?;
+            if incoming.stream_id != stream_id {
+                bail!("unexpected stream {} during push", incoming.stream_id);
+            }
+            match incoming.kind {
+                FrameKind::FileChunk => child_stdin.write_all(&incoming.payload).await?,
+                FrameKind::FileEnd => break,
+                _ => bail!("unexpected frame {:?} during push", incoming.kind),
+            }
         }
-        match incoming.kind {
-            FrameKind::FileChunk => child_stdin.write_all(&incoming.payload).await?,
-            FrameKind::FileEnd => break,
-            _ => bail!("unexpected frame {:?} during push", incoming.kind),
-        }
+        child_stdin.shutdown().await?;
+        Ok(())
     }
-    child_stdin.shutdown().await?;
+    .await;
     drop(child_stdin);
     let output = child.wait_with_output().await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if let Err(error) = transfer_result {
+        if !stderr.is_empty() {
+            bail!("write {}: {stderr}", request.path);
+        }
+        return Err(error).with_context(|| format!("write {}", request.path));
+    }
     if !output.status.success() {
-        bail!(
-            "write {}: {}",
-            request.path,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("write {}: {stderr}", request.path);
     }
     writer.send_raw(FrameKind::FileEnd, stream_id, &[]).await?;
     Ok(())
@@ -967,7 +1024,8 @@ async fn handle_pull(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Resu
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let mut child = command
         .spawn()
         .with_context(|| format!("open {}", request.path))?;

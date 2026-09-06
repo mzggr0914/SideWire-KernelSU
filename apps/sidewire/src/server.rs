@@ -11,7 +11,8 @@ use std::collections::HashSet;
 const FILE_BUFFER_SIZE: usize = 256 * 1024;
 const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
-const HEARTBEAT_TIMEOUT_SECS: u64 = 5;
+const HEARTBEAT_TIMEOUT_SECS: u64 = 10;
+const HEARTBEAT_MAX_MISSES: u32 = 3;
 
 #[derive(Clone, Copy, Debug)]
 enum ConnectionMode {
@@ -207,7 +208,12 @@ async fn device_listener(bind: &str, devices: DeviceMap, security: SecurityMode)
         let local_ip = stream.local_addr()?.ip();
         match accept_device(&mut stream, security).await {
             Ok(identity) => {
-                let transport = DeviceTransport::new(stream, identity.noise.clone());
+                let transport = DeviceTransport::new(
+                    stream,
+                    identity.noise.clone(),
+                    identity.protocol,
+                    identity.capabilities,
+                );
                 let session = DeviceSession {
                     id: identity.id,
                     name: identity.name,
@@ -490,26 +496,21 @@ async fn register_device(devices: &DeviceMap, session: DeviceSession) -> Result<
     let mode = session.mode;
     let peer = session.peer.clone();
     let monitor = session.clone();
-    let conflict = {
-        let mut guard = devices.write().await;
-        if let Some(existing) = guard.get(&id)
-            && !existing.transport.is_closed()
-        {
-            Some(format!(
-                "device {} ({}) is already connected via {} from {}",
-                existing.name,
-                id.short(),
-                existing.mode.as_str(),
-                existing.peer
-            ))
-        } else {
-            guard.insert(id, session);
-            None
-        }
-    };
-    if let Some(message) = conflict {
-        monitor.transport.close().await;
-        bail!(message);
+    let previous = devices.write().await.insert(id, session);
+    if let Some(existing) = previous
+        && !existing.transport.same_connection(&monitor.transport)
+        && !existing.transport.is_closed()
+    {
+        tracing::warn!(
+            device = %name,
+            device_id = %id.short(),
+            old_peer = %existing.peer,
+            new_peer = %peer,
+            "replacing stale device session"
+        );
+        tokio::spawn(async move {
+            existing.transport.close().await;
+        });
     }
     tracing::info!(device = %name, device_id = %id.short(), mode = mode.as_str(), %peer, "device connected");
     if monitor.capabilities & sidewire_protocol::capabilities::HEARTBEAT != 0 {
@@ -524,28 +525,63 @@ async fn register_device(devices: &DeviceMap, session: DeviceSession) -> Result<
 }
 
 async fn device_heartbeat(session: DeviceSession) {
+    let mut misses = 0u32;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
         if session.transport.is_closed() {
             return;
         }
-        match tokio::time::timeout(
+        let result = tokio::time::timeout(
             tokio::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS),
             remote_ping(&session),
         )
-        .await
-        {
-            Ok(Ok(_)) => {}
+        .await;
+        match result {
+            Ok(Ok(rtt_ms)) => {
+                if misses > 0 {
+                    tracing::info!(
+                        device = %session.name,
+                        device_id = %session.id.short(),
+                        rtt_ms,
+                        previous_misses = misses,
+                        "device heartbeat recovered"
+                    );
+                }
+                misses = 0;
+            }
             Ok(Err(error)) => {
-                tracing::warn!(device = %session.name, device_id = %session.id.short(), %error, "device heartbeat failed");
-                session.transport.close().await;
-                return;
+                if session.transport.is_closed() {
+                    return;
+                }
+                misses += 1;
+                tracing::warn!(
+                    device = %session.name,
+                    device_id = %session.id.short(),
+                    misses,
+                    max_misses = HEARTBEAT_MAX_MISSES,
+                    %error,
+                    "device heartbeat failed"
+                );
             }
             Err(_) => {
-                tracing::warn!(device = %session.name, device_id = %session.id.short(), "device heartbeat timed out");
-                session.transport.close().await;
-                return;
+                misses += 1;
+                tracing::warn!(
+                    device = %session.name,
+                    device_id = %session.id.short(),
+                    misses,
+                    max_misses = HEARTBEAT_MAX_MISSES,
+                    "device heartbeat timed out"
+                );
             }
+        }
+        if misses >= HEARTBEAT_MAX_MISSES {
+            tracing::warn!(
+                device = %session.name,
+                device_id = %session.id.short(),
+                "closing device after consecutive heartbeat failures"
+            );
+            session.transport.close().await;
+            return;
         }
     }
 }
@@ -573,7 +609,12 @@ async fn connect_endpoint_once(
             identity.id.short()
         );
     }
-    let transport = DeviceTransport::new(stream, identity.noise.clone());
+    let transport = DeviceTransport::new(
+        stream,
+        identity.noise.clone(),
+        identity.protocol,
+        identity.capabilities,
+    );
     let session = DeviceSession {
         id: identity.id,
         name: identity.name,
@@ -1377,6 +1418,16 @@ async fn remote_push(
             break;
         }
         stream.send_raw(FrameKind::FileChunk, &buffer[..n]).await?;
+        if let Some(response) = stream.try_recv()? {
+            match response.kind {
+                FrameKind::Error => bail!(
+                    "remote push error: {}",
+                    String::from_utf8_lossy(&response.payload)
+                ),
+                FrameKind::FileEnd => bail!("remote ended push before upload completed"),
+                other => bail!("unexpected push response during upload {other:?}"),
+            }
+        }
     }
     stream.send_raw(FrameKind::FileEnd, &[]).await?;
     let done = stream.recv().await?;

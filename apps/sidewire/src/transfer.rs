@@ -171,6 +171,14 @@ async fn push_path(
     let local = tokio::fs::canonicalize(local).await?;
     let metadata = tokio::fs::metadata(&local).await?;
     if metadata.is_file() {
+        let remote = if remote_is_dir(control, device.clone(), run_as, &remote).await? {
+            let file_name = local
+                .file_name()
+                .context("local file path does not have a file name")?;
+            remote_join(&remote, Path::new(file_name))?
+        } else {
+            remote
+        };
         let bytes = push_file(control, device, run_as, &local, remote).await?;
         return Ok(format!("pushed 1 file ({bytes} bytes)"));
     }
