@@ -1,7 +1,7 @@
 import { exec, toast } from 'kernelsu';
 import './style.css';
 
-const ctl='/data/adb/modules/sidewire/bin/sidewirectl';
+const ctl='$(if [ -x /data/adb/modules/sidewire/bin/sidewirectl ]; then printf %s /data/adb/modules/sidewire/bin/sidewirectl; elif [ -x /data/adb/modules_update/sidewire/bin/sidewirectl ]; then printf %s /data/adb/modules_update/sidewire/bin/sidewirectl; else printf %s /data/adb/modules/sidewire/bin/sidewirectl; fi)';
 const app=document.querySelector('#app');
 app.innerHTML=`
 <section class="hero"><div><h1>SideWire</h1><div class="muted">Native Android bridge</div></div><span class="badge" id="state">loading</span></section>

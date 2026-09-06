@@ -4,6 +4,7 @@
 
 ## 0.9.8
 
+- resolve the WebUI controller from active or staged KernelSU module paths so controls work immediately after install/update
 - isolate logical-stream backpressure so a stalled PTY, logcat, or transfer cannot block the shared transport reader
 - add protocol 1.1 stream cancellation with protocol 1.0 fallback behavior
 - tolerate transient heartbeat delays and replace stale sessions when an outbound device reconnects
