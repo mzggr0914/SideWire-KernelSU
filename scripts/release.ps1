@@ -15,6 +15,11 @@ $moduleProp = Get-Content (Join-Path $root "module\module.prop") -Raw
 if ($moduleProp -notmatch "(?m)^version=$([regex]::Escape($version))\r?$") {
     throw "module/module.prop version does not match Cargo.toml ($version)"
 }
+$sidewireCtlPath = Join-Path $root "module\bin\sidewirectl"
+$sidewireCtlBytes = [System.IO.File]::ReadAllBytes($sidewireCtlPath)
+if ($sidewireCtlBytes -contains [byte]13) {
+    throw "module/bin/sidewirectl must use LF line endings"
+}
 $customize = Get-Content (Join-Path $root "module\customize.sh") -Raw
 if ($customize -notmatch "SideWire $([regex]::Escape($version))") {
     throw "module/customize.sh version does not match Cargo.toml ($version)"

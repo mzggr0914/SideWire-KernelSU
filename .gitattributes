@@ -3,6 +3,7 @@
 *.toml text eol=lf
 *.lock text eol=lf
 *.sh text eol=lf
+module/bin/sidewirectl text eol=lf
 *.js text eol=lf
 *.css text eol=lf
 *.html text eol=lf

@@ -48,6 +48,13 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Verify Android controller line endings
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("module/bin/sidewirectl")
+          if ($bytes -contains [byte]13) {
+            throw "module/bin/sidewirectl must use LF line endings"
+          }
       - name: Rust toolchain
         run: |
           rustup update stable
