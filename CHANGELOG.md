@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.9.9
+
+- use the configured SideWire device name as the Android PTY hostname so shell prompts show names like `A32` instead of `android`
+
 ## 0.9.8
 
 - force the extensionless Android `sidewirectl` script to LF in Windows release checkouts and reject CRLF during packaging
