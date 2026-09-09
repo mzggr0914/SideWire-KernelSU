@@ -14,7 +14,7 @@ body:
     id: version
     attributes:
       label: SideWire version
-      placeholder: 0.9.8
+      placeholder: 0.9.9
     validations:
       required: true
   - type: input
