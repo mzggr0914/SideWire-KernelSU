@@ -546,9 +546,16 @@ async fn serve(
                     let mut inbox = register_stream(&routes, stream_id).await?;
                     let writer = writer.clone();
                     let routes = routes.clone();
+                    let device_name = name.to_owned();
                     tokio::spawn(async move {
-                        let result =
-                            handle_pty(&writer, stream_id, &request.payload, &mut inbox).await;
+                        let result = handle_pty(
+                            &writer,
+                            stream_id,
+                            &request.payload,
+                            &mut inbox,
+                            &device_name,
+                        )
+                        .await;
                         unregister_stream(&routes, stream_id).await;
                         if let Err(error) = result {
                             writer.send_error(stream_id, error).await;
@@ -1222,16 +1229,17 @@ async fn handle_pty(
     stream_id: u32,
     payload: &[u8],
     inbox: &mut tokio::sync::mpsc::Receiver<Frame>,
+    device_name: &str,
 ) -> Result<()> {
     let request: PtyOpenRequest = decode(payload)?;
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (writer, stream_id, request, inbox);
+        let _ = (writer, stream_id, request, inbox, device_name);
         bail!("PTY is only supported by the Android daemon");
     }
     #[cfg(target_os = "android")]
     {
-        let hostname = android_shell_hostname();
+        let hostname = sanitize_shell_hostname(device_name).unwrap_or_else(android_shell_hostname);
         let (mut master_read, mut master_write, resize, slave_name) =
             open_pty_master(request.cols.max(1), request.rows.max(1))?;
         let mut command = command_for_identity(&request.program, &request.args, request.identity);
