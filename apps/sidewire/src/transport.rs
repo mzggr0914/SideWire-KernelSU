@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
-    sync::{Mutex, Notify, mpsc, oneshot, watch},
+    sync::{Notify, mpsc, oneshot, watch},
 };
 
 const ROUTE_CAPACITY: usize = 16;
@@ -80,7 +80,7 @@ struct WriterCommand {
 
 struct TransportInner {
     writer: mpsc::Sender<WriterCommand>,
-    routes: Mutex<HashMap<u32, RouteSender>>,
+    routes: StdMutex<HashMap<u32, RouteSender>>,
     next_stream_id: AtomicU32,
     closed: AtomicBool,
     shutdown_notify: Notify,
@@ -168,7 +168,7 @@ impl DeviceTransport {
         let (writer_tx, mut writer_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
         let inner = Arc::new(TransportInner {
             writer: writer_tx,
-            routes: Mutex::new(HashMap::new()),
+            routes: StdMutex::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
@@ -255,7 +255,7 @@ impl DeviceTransport {
                     let flow = inner
                         .routes
                         .lock()
-                        .await
+                        .unwrap()
                         .get(&stream_id)
                         .and_then(|route| route.flow.clone());
                     if let Some(flow) = flow {
@@ -269,7 +269,7 @@ impl DeviceTransport {
                     continue;
                 }
                 if frame.kind == FrameKind::StreamCancel {
-                    let route = inner.routes.lock().await.remove(&stream_id);
+                    let route = inner.routes.lock().unwrap().remove(&stream_id);
                     if let Some(route) = route {
                         let reason = if frame.payload.is_empty() {
                             format!("remote canceled stream {stream_id}")
@@ -283,12 +283,12 @@ impl DeviceTransport {
                     continue;
                 }
 
-                let route = { inner.routes.lock().await.get(&stream_id).cloned() };
+                let route = { inner.routes.lock().unwrap().get(&stream_id).cloned() };
                 match route {
                     Some(route) => match route.sender.try_send(frame) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            inner.routes.lock().await.remove(&stream_id);
+                            inner.routes.lock().unwrap().remove(&stream_id);
                             let reason = format!(
                                 "stream {stream_id} receive queue overflow; stream canceled"
                             );
@@ -297,7 +297,7 @@ impl DeviceTransport {
                             tokio::spawn(send_stream_cancel(inner.clone(), stream_id, reason));
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            inner.routes.lock().await.remove(&stream_id);
+                            inner.routes.lock().unwrap().remove(&stream_id);
                         }
                     },
                     None if frame.kind == FrameKind::Pong => {
@@ -311,7 +311,7 @@ impl DeviceTransport {
                 }
             }
             signal_closed(&inner);
-            inner.routes.lock().await.clear();
+            inner.routes.lock().unwrap().clear();
         });
 
         transport
@@ -327,7 +327,7 @@ impl DeviceTransport {
 
     pub(super) async fn close(&self) {
         signal_closed(&self.inner);
-        self.inner.routes.lock().await.clear();
+        self.inner.routes.lock().unwrap().clear();
     }
 
     pub(super) async fn send_frame(&self, frame: &Frame) -> Result<()> {
@@ -358,7 +358,7 @@ impl DeviceTransport {
                 .inner
                 .supports_flow_control
                 .then(|| Arc::new(FlowCredit::new()));
-            let mut routes = self.inner.routes.lock().await;
+            let mut routes = self.inner.routes.lock().unwrap();
             if self.inner.closed.load(Ordering::Acquire) {
                 bail!("device connection is closed");
             }
@@ -540,20 +540,19 @@ impl DeviceStream {
 
 impl Drop for DeviceStream {
     fn drop(&mut self) {
-        let transport = self.transport.clone();
         let id = self.id;
-        let completed = self.completed;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        self.transport.inner.routes.lock().unwrap().remove(&id);
+        if !self.completed
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let inner = self.transport.inner.clone();
             handle.spawn(async move {
-                transport.inner.routes.lock().await.remove(&id);
-                if !completed {
-                    send_stream_cancel(
-                        transport.inner.clone(),
-                        id,
-                        "local stream dropped before completion".to_owned(),
-                    )
-                    .await;
-                }
+                send_stream_cancel(
+                    inner,
+                    id,
+                    "local stream dropped before completion".to_owned(),
+                )
+                .await;
             });
         }
     }

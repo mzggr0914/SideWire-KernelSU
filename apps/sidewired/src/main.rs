@@ -12,7 +12,12 @@ use sidewire_protocol::{PtyCompleteRequest, PtyExit, PtyOpenAck, PtyResize};
 use std::fs::File as StdFile;
 #[cfg(target_os = "android")]
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::{collections::HashMap, fs, process::Stdio, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    process::Stdio,
+    sync::{Arc, Mutex as StdMutex},
+};
 mod completion;
 mod security;
 mod transport;
@@ -33,8 +38,8 @@ const FILE_FLOW_WINDOW: usize = 1024 * 1024;
 const FILE_FLOW_UPDATE_THRESHOLD: usize = FILE_FLOW_WINDOW / 2;
 const MAX_CLIPBOARD_TEXT: usize = 4 * 1024 * 1024;
 
-type StreamRoutes = Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Frame>>>>;
-type StreamCancels = Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::watch::Sender<bool>>>>;
+type StreamRoutes = Arc<StdMutex<HashMap<u32, tokio::sync::mpsc::Sender<Frame>>>>;
+type StreamCancels = Arc<StdMutex<HashMap<u32, tokio::sync::watch::Sender<bool>>>>;
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -421,7 +426,7 @@ async fn register_stream(
     stream_id: u32,
 ) -> Result<tokio::sync::mpsc::Receiver<Frame>> {
     let (sender, receiver) = tokio::sync::mpsc::channel(STREAM_ROUTE_CAPACITY);
-    let mut routes = routes.lock().await;
+    let mut routes = routes.lock().unwrap();
     if routes.contains_key(&stream_id) {
         bail!("stream {stream_id} is already active");
     }
@@ -430,7 +435,7 @@ async fn register_stream(
 }
 
 async fn unregister_stream(routes: &StreamRoutes, stream_id: u32) {
-    routes.lock().await.remove(&stream_id);
+    routes.lock().unwrap().remove(&stream_id);
 }
 
 async fn register_cancel(
@@ -438,7 +443,7 @@ async fn register_cancel(
     stream_id: u32,
 ) -> Result<tokio::sync::watch::Receiver<bool>> {
     let (sender, receiver) = tokio::sync::watch::channel(false);
-    let mut cancels = cancels.lock().await;
+    let mut cancels = cancels.lock().unwrap();
     if cancels.insert(stream_id, sender).is_some() {
         bail!("stream {stream_id} already has a cancellation route");
     }
@@ -446,7 +451,7 @@ async fn register_cancel(
 }
 
 async fn unregister_cancel(cancels: &StreamCancels, stream_id: u32) {
-    cancels.lock().await.remove(&stream_id);
+    cancels.lock().unwrap().remove(&stream_id);
 }
 
 async fn wait_for_stream_cancel(cancel: &mut tokio::sync::watch::Receiver<bool>) {
@@ -584,8 +589,8 @@ async fn serve(mut stream: TcpStream, options: ServeOptions) -> Result<()> {
         supports_stream_cancel,
         supports_flow_control,
     );
-    let routes: StreamRoutes = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let cancels: StreamCancels = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let routes: StreamRoutes = Arc::new(StdMutex::new(HashMap::new()));
+    let cancels: StreamCancels = Arc::new(StdMutex::new(HashMap::new()));
     let proxies = Arc::new(tokio::sync::Mutex::new(HashMap::<
         String,
         tokio::task::JoinHandle<()>,
@@ -622,8 +627,8 @@ async fn serve(mut stream: TcpStream, options: ServeOptions) -> Result<()> {
             }
             if request.kind == FrameKind::StreamCancel {
                 writer.cancel_local(stream_id);
-                let routed = routes.lock().await.remove(&stream_id).is_some();
-                let canceled = if let Some(cancel) = cancels.lock().await.remove(&stream_id) {
+                let routed = routes.lock().unwrap().remove(&stream_id).is_some();
+                let canceled = if let Some(cancel) = cancels.lock().unwrap().remove(&stream_id) {
                     let _ = cancel.send(true);
                     true
                 } else {
@@ -633,12 +638,12 @@ async fn serve(mut stream: TcpStream, options: ServeOptions) -> Result<()> {
                 continue;
             }
 
-            let routed = { routes.lock().await.get(&stream_id).cloned() };
+            let routed = { routes.lock().unwrap().get(&stream_id).cloned() };
             if let Some(sender) = routed {
                 match sender.try_send(request) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        routes.lock().await.remove(&stream_id);
+                        routes.lock().unwrap().remove(&stream_id);
                         let reason =
                             format!("stream {stream_id} receive queue overflow; stream canceled");
                         tracing::warn!(stream_id, "host stream receive queue overflow");
@@ -648,7 +653,7 @@ async fn serve(mut stream: TcpStream, options: ServeOptions) -> Result<()> {
                         });
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        routes.lock().await.remove(&stream_id);
+                        routes.lock().unwrap().remove(&stream_id);
                     }
                 }
                 continue;
@@ -860,13 +865,13 @@ async fn serve(mut stream: TcpStream, options: ServeOptions) -> Result<()> {
     .await;
 
     {
-        let mut routes = routes.lock().await;
+        let mut routes = routes.lock().unwrap();
         for stream_id in routes.keys().copied().collect::<Vec<_>>() {
             writer.cancel_local(stream_id);
         }
         routes.clear();
     }
-    for (stream_id, cancel) in cancels.lock().await.drain() {
+    for (stream_id, cancel) in cancels.lock().unwrap().drain() {
         writer.cancel_local(stream_id);
         let _ = cancel.send(true);
     }
