@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: pnpm/setup@v2
         with:
-          version: 11
+          version: 12.3.4
           runtime: node@24
       - name: Install
         run: pnpm install --frozen-lockfile
