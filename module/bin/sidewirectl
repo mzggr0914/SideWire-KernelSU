@@ -5,6 +5,8 @@ STATE_DIR="/data/adb/sidewire"
 CONFIG="$STATE_DIR/sidewire.conf"
 PIDFILE="$STATE_DIR/sidewired.pid"
 LOGFILE="$STATE_DIR/sidewired.log"
+LOG_MAX_BYTES=1048576
+LOG_KEEP_BYTES=262144
 PAIRING_FILE="$STATE_DIR/pairing"
 ACTION_FILE="$STATE_DIR/action"
 PAIRS_DIR="$STATE_DIR/paired_hosts"
@@ -129,6 +131,19 @@ request_action(){
   chmod 0600 "$ACTION_FILE"
   ksud module action sidewire
 }
+trim_log(){
+  [ -f "$LOGFILE" ] || return 0
+  size="$(wc -c < "$LOGFILE" 2>/dev/null)"
+  case "$size" in ''|*[!0-9]*) return 0;; esac
+  [ "$size" -le "$LOG_MAX_BYTES" ] && return 0
+  tmp="$LOGFILE.trim.$"
+  if tail -c "$LOG_KEEP_BYTES" "$LOGFILE" > "$tmp" 2>/dev/null; then
+    chmod 0600 "$tmp" 2>/dev/null
+    mv -f "$tmp" "$LOGFILE"
+  else
+    rm -f "$tmp"
+  fi
+}
 
 start_daemon(){
   ensure_state
@@ -142,6 +157,7 @@ start_daemon(){
   rm -f "$LEGACY_PIDFILE"
   [ -n "$current" ] && exit 0
   write_config
+  trim_log
   "$DAEMON" --config "$CONFIG" >>"$LOGFILE" 2>&1 &
   echo $! > "$PIDFILE"
 }

@@ -25,6 +25,8 @@ const STREAM_ROUTE_CAPACITY: usize = 16;
 const HOST_SILENCE_TIMEOUT_SECS: u64 = 45;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const CONNECTION_SETUP_TIMEOUT_SECS: u64 = 10;
+const OUTBOUND_BACKOFF_MAX_SECS: u64 = 30;
+const OUTBOUND_FAILURE_LOG_INTERVAL_SECS: u64 = 30;
 const STREAM_CANCEL_PROTOCOL_MINOR: u8 = 1;
 const FLOW_CONTROL_PROTOCOL_MINOR: u8 = 2;
 const FILE_FLOW_WINDOW: usize = 1024 * 1024;
@@ -38,7 +40,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     process::Command,
-    sync::Notify,
+    sync::{Notify, oneshot},
     time::{Duration, sleep},
 };
 
@@ -263,12 +265,15 @@ async fn run_inbound(
         tokio::spawn(async move {
             if let Err(error) = serve(
                 stream,
-                &name,
-                device_id,
-                true,
-                security,
-                pairs_dir,
-                clipboard_helper,
+                ServeOptions {
+                    name,
+                    device_id,
+                    inbound: true,
+                    security_mode: security,
+                    pairs_dir,
+                    clipboard_helper,
+                    established: None,
+                },
             )
             .await
             {
@@ -305,6 +310,34 @@ async fn run_discovery_responder(
     }
 }
 
+fn next_outbound_delay(delay: u64, pairing_grace: &mut u8) -> u64 {
+    if *pairing_grace > 0 {
+        *pairing_grace -= 1;
+        1
+    } else {
+        delay.saturating_mul(2).min(OUTBOUND_BACKOFF_MAX_SECS)
+    }
+}
+
+fn log_outbound_failure(
+    server: &str,
+    message: &str,
+    last_log: &mut Option<std::time::Instant>,
+    suppressed: &mut u32,
+) {
+    let should_log = last_log.is_none_or(|last| {
+        last.elapsed() >= Duration::from_secs(OUTBOUND_FAILURE_LOG_INTERVAL_SECS)
+    });
+    if should_log {
+        tracing::warn!(%server, error = %message, suppressed = *suppressed, "outbound connection failed");
+        *last_log = Some(std::time::Instant::now());
+        *suppressed = 0;
+    } else {
+        *suppressed = suppressed.saturating_add(1);
+        tracing::debug!(%server, error = %message, "outbound connection retry failed");
+    }
+}
+
 async fn run_outbound(
     server: &str,
     name: &str,
@@ -316,8 +349,10 @@ async fn run_outbound(
 ) -> Result<()> {
     let mut delay = 1u64;
     let mut pairing_grace = 0u8;
+    let mut last_failure_log = None;
+    let mut suppressed_failures = 0u32;
     loop {
-        match tokio::time::timeout(
+        let failure = match tokio::time::timeout(
             Duration::from_secs(CONNECT_TIMEOUT_SECS),
             TcpStream::connect(server),
         )
@@ -325,33 +360,52 @@ async fn run_outbound(
         {
             Ok(Ok(stream)) => {
                 stream.set_nodelay(true).context("enable TCP_NODELAY")?;
-                tracing::info!(%server, "connected to SideWire host");
-                if let Err(error) = serve(
+                tracing::debug!(%server, "TCP connection to SideWire host established");
+                let (established_tx, mut established_rx) = oneshot::channel();
+                let result = serve(
                     stream,
-                    name,
-                    device_id,
-                    false,
-                    security,
-                    pairs_dir.clone(),
-                    clipboard_helper.clone(),
+                    ServeOptions {
+                        name: name.to_owned(),
+                        device_id,
+                        inbound: false,
+                        security_mode: security,
+                        pairs_dir: pairs_dir.clone(),
+                        clipboard_helper: clipboard_helper.clone(),
+                        established: Some(established_tx),
+                    },
                 )
-                .await
-                {
-                    tracing::warn!(%error, "host connection ended");
+                .await;
+                if established_rx.try_recv().is_ok() {
+                    last_failure_log = None;
+                    suppressed_failures = 0;
+                    delay = 1;
+                    if let Err(error) = result {
+                        tracing::warn!(%server, %error, "host session ended");
+                    }
+                    None
+                } else {
+                    Some(match result {
+                        Ok(()) => "connection ended before SideWire handshake completed".to_owned(),
+                        Err(error) => error.to_string(),
+                    })
                 }
-                delay = 1;
             }
-            Ok(Err(error)) => tracing::warn!(%server, %error, "outbound connect failed"),
-            Err(_) => tracing::warn!(%server, "outbound connect timed out"),
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some(format!(
+                "TCP connect timed out after {CONNECT_TIMEOUT_SECS}s"
+            )),
+        };
+        if let Some(failure) = failure {
+            log_outbound_failure(
+                server,
+                &failure,
+                &mut last_failure_log,
+                &mut suppressed_failures,
+            );
         }
         tokio::select! {
             _ = sleep(Duration::from_secs(delay)) => {
-                if pairing_grace > 0 {
-                    pairing_grace -= 1;
-                    delay = 1;
-                } else {
-                    delay = (delay * 2).min(5);
-                }
+                delay = next_outbound_delay(delay, &mut pairing_grace);
             }
             _ = reconnect.notified() => {
                 tracing::info!(%server, "pairing completed; enabling rapid outbound reconnects");
@@ -419,15 +473,26 @@ fn daemon_capabilities(clipboard_helper: Option<&str>) -> u64 {
     capabilities
 }
 
-async fn serve(
-    mut stream: TcpStream,
-    name: &str,
+struct ServeOptions {
+    name: String,
     device_id: DeviceId,
     inbound: bool,
     security_mode: SecurityMode,
     pairs_dir: Option<String>,
     clipboard_helper: Option<String>,
-) -> Result<()> {
+    established: Option<oneshot::Sender<()>>,
+}
+
+async fn serve(mut stream: TcpStream, options: ServeOptions) -> Result<()> {
+    let ServeOptions {
+        name,
+        device_id,
+        inbound,
+        security_mode,
+        pairs_dir,
+        clipboard_helper,
+        mut established,
+    } = options;
     let local_capabilities = daemon_capabilities(clipboard_helper.as_deref());
     let (noise, shared_secret, peer_capabilities, negotiated_protocol) = tokio::time::timeout(
         Duration::from_secs(CONNECTION_SETUP_TIMEOUT_SECS),
@@ -458,7 +523,7 @@ async fn serve(
         tracing::info!(peer = %hello.name, host_id = %secured.peer_id.short(), security = security_mode.as_str(), "handshake complete");
         send_ack(
             &mut stream,
-            name,
+            &name,
             device_id,
             noise.clone(),
             local_capabilities,
@@ -492,6 +557,7 @@ async fn serve(
         if ack.capabilities & sidewire_protocol::capabilities::CORE == 0 {
             bail!("host does not advertise the core capability");
         }
+        tracing::info!(host = %ack.name, protocol = %sidewire_protocol::protocol_label(protocol), security = security_mode.as_str(), "handshake complete");
         (ack.capabilities, protocol)
     };
     Ok::<_, anyhow::Error>((noise, shared_secret, peer_capabilities, negotiated_protocol))
@@ -506,6 +572,9 @@ async fn serve(
     let supports_flow_control = sidewire_protocol::protocol_minor(negotiated_protocol)
         >= FLOW_CONTROL_PROTOCOL_MINOR
         && negotiated_capabilities & sidewire_protocol::capabilities::FLOW_CONTROL != 0;
+    if let Some(established) = established.take() {
+        let _ = established.send(());
+    }
 
     let (reader_half, writer_half) = stream.into_split();
     let mut reader = SecureFrameReader::new(reader_half, noise.clone());
@@ -1744,7 +1813,26 @@ async fn start_proxy(
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_shell_hostname, shell_quote};
+    use super::{next_outbound_delay, sanitize_shell_hostname, shell_quote};
+
+    #[test]
+    fn outbound_backoff_grows_and_pairing_grace_forces_fast_retry() {
+        let mut grace = 0;
+        let mut delay = 1;
+        let mut observed = Vec::new();
+        for _ in 0..6 {
+            delay = next_outbound_delay(delay, &mut grace);
+            observed.push(delay);
+        }
+        assert_eq!(observed, vec![2, 4, 8, 16, 30, 30]);
+
+        grace = 2;
+        assert_eq!(next_outbound_delay(30, &mut grace), 1);
+        assert_eq!(grace, 1);
+        assert_eq!(next_outbound_delay(1, &mut grace), 1);
+        assert_eq!(grace, 0);
+        assert_eq!(next_outbound_delay(1, &mut grace), 2);
+    }
 
     #[test]
     fn shell_quote_preserves_arguments() {
