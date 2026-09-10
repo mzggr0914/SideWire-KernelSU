@@ -65,7 +65,7 @@ sidewire push .\build /data/local/tmp/build
 sidewire pull /sdcard/MyFolder .\MyFolder
 ```
 
-`clipboard push`는 PC 클립보드를 Android로 보내고, `pull`은 Android 클립보드를 PC로 가져옵니다.
+`clipboard push`는 PC 클립보드를 Android로 보내고, `pull`은 Android 클립보드를 PC로 가져옵니다. 재귀 `push`/`pull`은 기본적으로 파일을 최대 4개까지 병렬 전송하며 `--jobs 1..16`으로 동시성을 조절할 수 있습니다. 프로토콜 1.2 상대끼리는 파일 청크에 receive-window flow control도 적용하고, 이전 버전 상대와는 기존 방식으로 호환됩니다.
 
 ## 연결 모드
 

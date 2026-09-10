@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- add protocol 1.2 receive-window flow control for file chunks while preserving protocol 1.1 fallback behavior
+- parallelize recursive file transfers with bounded `--jobs` concurrency and batch remote directory creation
+- reduce transport hot-path contention by removing async locks from per-frame stream routing
+- harden stream cancellation, writer shutdown, and secure-frame buffering under stalled or canceled transfers
+- reduce Android outbound idle overhead with handshake-aware reconnect backoff, rate-limited failure logs, and startup log trimming
+
 ## 0.9.9
 
 - use the configured SideWire device name as the Android PTY hostname so shell prompts show names like `A32` instead of `android`
