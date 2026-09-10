@@ -1,8 +1,9 @@
-use crate::{Frame, FrameKind, decode_frame_bytes, encode_frame_bytes, raw_frame};
+use crate::frame::{decode_frame_header, frame_header};
+use crate::{Frame, FrameKind, HEADER_LEN};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use snow::TransportState;
-use std::sync::Arc;
+use std::{io::IoSlice, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::Mutex,
@@ -88,23 +89,51 @@ pub async fn write_raw_packet<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8
     if bytes.len() > MAX_PACKET {
         bail!("security packet too large: {} bytes", bytes.len());
     }
-    writer
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await?;
-    writer.write_all(bytes).await?;
+    let header = (bytes.len() as u32).to_be_bytes();
+    let mut header_offset = 0usize;
+    let mut bytes_offset = 0usize;
+    while header_offset < header.len() {
+        let parts = [
+            IoSlice::new(&header[header_offset..]),
+            IoSlice::new(&bytes[bytes_offset..]),
+        ];
+        let written = writer.write_vectored(&parts).await?;
+        if written == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+        }
+        let header_left = header.len() - header_offset;
+        if written < header_left {
+            header_offset += written;
+            continue;
+        }
+        header_offset = header.len();
+        bytes_offset += written - header_left;
+    }
+    if bytes_offset < bytes.len() {
+        writer.write_all(&bytes[bytes_offset..]).await?;
+    }
     writer.flush().await?;
     Ok(())
 }
 
-pub async fn read_raw_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+async fn read_raw_packet_into<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    bytes: &mut Vec<u8>,
+) -> Result<usize> {
     let mut header = [0u8; 4];
     reader.read_exact(&mut header).await?;
     let len = u32::from_be_bytes(header) as usize;
     if len > MAX_PACKET {
         bail!("security packet too large: {len} bytes");
     }
-    let mut bytes = vec![0u8; len];
-    reader.read_exact(&mut bytes).await?;
+    bytes.resize(len, 0);
+    reader.read_exact(bytes).await?;
+    Ok(len)
+}
+
+pub async fn read_raw_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    read_raw_packet_into(reader, &mut bytes).await?;
     Ok(bytes)
 }
 
@@ -169,10 +198,11 @@ where
     Ok(Arc::new(Mutex::new(transport)))
 }
 
-pub async fn write_noise_record<W: AsyncWrite + Unpin>(
+async fn write_noise_record_with_buffer<W: AsyncWrite + Unpin>(
     writer: &mut W,
     noise: &SharedNoise,
     plaintext: &[u8],
+    output: &mut Vec<u8>,
 ) -> Result<()> {
     if plaintext.len() > NOISE_CHUNK + 1 {
         bail!(
@@ -180,59 +210,123 @@ pub async fn write_noise_record<W: AsyncWrite + Unpin>(
             plaintext.len()
         );
     }
-    let mut output = vec![0u8; plaintext.len() + 32];
+    output.resize(plaintext.len() + 32, 0);
     let written = {
         let mut state = noise.lock().await;
-        state.write_message(plaintext, &mut output)?
+        state.write_message(plaintext, output)?
     };
     write_raw_packet(writer, &output[..written]).await
+}
+
+pub async fn write_noise_record<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    noise: &SharedNoise,
+    plaintext: &[u8],
+) -> Result<()> {
+    let mut output = Vec::new();
+    write_noise_record_with_buffer(writer, noise, plaintext, &mut output).await
+}
+
+async fn read_noise_record_into<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    noise: &SharedNoise,
+    encrypted: &mut Vec<u8>,
+    plaintext: &mut Vec<u8>,
+) -> Result<usize> {
+    let encrypted_len = read_raw_packet_into(reader, encrypted).await?;
+    plaintext.resize(encrypted_len, 0);
+    let written = {
+        let mut state = noise.lock().await;
+        state.read_message(&encrypted[..encrypted_len], plaintext)?
+    };
+    plaintext.truncate(written);
+    Ok(written)
 }
 
 pub async fn read_noise_record<R: AsyncRead + Unpin>(
     reader: &mut R,
     noise: &SharedNoise,
 ) -> Result<Vec<u8>> {
-    let encrypted = read_raw_packet(reader).await?;
-    let mut plaintext = vec![0u8; encrypted.len()];
-    let written = {
-        let mut state = noise.lock().await;
-        state.read_message(&encrypted, &mut plaintext)?
-    };
-    plaintext.truncate(written);
+    let mut encrypted = Vec::new();
+    let mut plaintext = Vec::new();
+    read_noise_record_into(reader, noise, &mut encrypted, &mut plaintext).await?;
     Ok(plaintext)
 }
 
 pub struct SecureFrameReader<R> {
     inner: R,
     noise: Option<SharedNoise>,
+    encrypted_scratch: Vec<u8>,
+    plaintext_scratch: Vec<u8>,
 }
 
 impl<R> SecureFrameReader<R> {
     pub fn new(inner: R, noise: Option<SharedNoise>) -> Self {
-        Self { inner, noise }
+        Self {
+            inner,
+            noise,
+            encrypted_scratch: Vec::with_capacity(NOISE_CHUNK + 32),
+            plaintext_scratch: Vec::with_capacity(NOISE_CHUNK + 32),
+        }
     }
 }
 
 impl<R: AsyncRead + Unpin> SecureFrameReader<R> {
     pub async fn read_frame(&mut self) -> Result<Frame> {
-        let Some(noise) = &self.noise else {
+        let Some(noise) = self.noise.clone() else {
             return crate::read_frame(&mut self.inner).await;
         };
-        let mut encoded = Vec::new();
+        let mut header = [0u8; HEADER_LEN];
+        let mut header_filled = 0usize;
+        let mut metadata = None;
+        let mut payload = Vec::new();
         loop {
-            let record = read_noise_record(&mut self.inner, noise).await?;
-            let (&final_flag, bytes) = record
+            read_noise_record_into(
+                &mut self.inner,
+                &noise,
+                &mut self.encrypted_scratch,
+                &mut self.plaintext_scratch,
+            )
+            .await?;
+            let (&final_flag, mut bytes) = self
+                .plaintext_scratch
                 .split_first()
                 .context("empty encrypted SideWire record")?;
             if final_flag > 1 {
                 bail!("invalid encrypted SideWire record flag {final_flag}");
             }
-            encoded.extend_from_slice(bytes);
-            if encoded.len() > crate::MAX_PAYLOAD + crate::HEADER_LEN {
-                bail!("encrypted SideWire frame exceeded maximum size");
+            if header_filled < HEADER_LEN {
+                let take = (HEADER_LEN - header_filled).min(bytes.len());
+                header[header_filled..header_filled + take].copy_from_slice(&bytes[..take]);
+                header_filled += take;
+                bytes = &bytes[take..];
+                if header_filled == HEADER_LEN {
+                    let decoded = decode_frame_header(&header)?;
+                    payload = Vec::with_capacity(decoded.2);
+                    metadata = Some(decoded);
+                }
+            }
+            if let Some((_, _, expected)) = metadata {
+                if payload.len() + bytes.len() > expected {
+                    bail!("encrypted SideWire frame exceeded declared payload length");
+                }
+                payload.extend_from_slice(bytes);
+                if final_flag == 0 && payload.len() == expected {
+                    bail!("encrypted SideWire frame missing final record flag");
+                }
             }
             if final_flag == 1 {
-                return decode_frame_bytes(&encoded);
+                let Some((kind, stream_id, expected)) = metadata else {
+                    bail!("truncated encrypted SideWire frame header");
+                };
+                if payload.len() != expected {
+                    bail!("invalid SideWire frame length");
+                }
+                return Ok(Frame {
+                    kind,
+                    stream_id,
+                    payload,
+                });
             }
         }
     }
@@ -241,11 +335,18 @@ impl<R: AsyncRead + Unpin> SecureFrameReader<R> {
 pub struct SecureFrameWriter<W> {
     inner: W,
     noise: Option<SharedNoise>,
+    plain_scratch: Vec<u8>,
+    cipher_scratch: Vec<u8>,
 }
 
 impl<W> SecureFrameWriter<W> {
     pub fn new(inner: W, noise: Option<SharedNoise>) -> Self {
-        Self { inner, noise }
+        Self {
+            inner,
+            noise,
+            plain_scratch: Vec::with_capacity(NOISE_CHUNK + 1),
+            cipher_scratch: Vec::with_capacity(NOISE_CHUNK + 33),
+        }
     }
 
     pub fn into_inner(self) -> W {
@@ -255,18 +356,8 @@ impl<W> SecureFrameWriter<W> {
 
 impl<W: AsyncWrite + Unpin> SecureFrameWriter<W> {
     pub async fn write_frame(&mut self, frame: &Frame) -> Result<()> {
-        let Some(noise) = &self.noise else {
-            return crate::write_frame(&mut self.inner, frame).await;
-        };
-        let encoded = encode_frame_bytes(frame)?;
-        let chunk_count = encoded.len().div_ceil(NOISE_CHUNK);
-        for (index, chunk) in encoded.chunks(NOISE_CHUNK).enumerate() {
-            let mut record = Vec::with_capacity(chunk.len() + 1);
-            record.push(u8::from(index + 1 == chunk_count));
-            record.extend_from_slice(chunk);
-            write_noise_record(&mut self.inner, noise, &record).await?;
-        }
-        Ok(())
+        self.write_raw(frame.kind, frame.stream_id, &frame.payload)
+            .await
     }
 
     pub async fn write_raw(
@@ -275,8 +366,42 @@ impl<W: AsyncWrite + Unpin> SecureFrameWriter<W> {
         stream_id: u32,
         payload: &[u8],
     ) -> Result<()> {
-        self.write_frame(&raw_frame(kind, stream_id, payload.to_vec()))
-            .await
+        let Some(noise) = self.noise.clone() else {
+            return crate::write_raw_frame(&mut self.inner, kind, stream_id, payload).await;
+        };
+        let header = frame_header(kind, stream_id, payload.len())?;
+        let total = HEADER_LEN + payload.len();
+        let mut offset = 0usize;
+        while offset < total {
+            let chunk_len = (total - offset).min(NOISE_CHUNK);
+            self.plain_scratch.clear();
+            self.plain_scratch
+                .push(u8::from(offset + chunk_len == total));
+            if offset < HEADER_LEN {
+                let header_end = (offset + chunk_len).min(HEADER_LEN);
+                self.plain_scratch
+                    .extend_from_slice(&header[offset..header_end]);
+                let used = header_end - offset;
+                let payload_take = chunk_len - used;
+                if payload_take > 0 {
+                    self.plain_scratch
+                        .extend_from_slice(&payload[..payload_take]);
+                }
+            } else {
+                let payload_start = offset - HEADER_LEN;
+                self.plain_scratch
+                    .extend_from_slice(&payload[payload_start..payload_start + chunk_len]);
+            }
+            write_noise_record_with_buffer(
+                &mut self.inner,
+                &noise,
+                &self.plain_scratch,
+                &mut self.cipher_scratch,
+            )
+            .await?;
+            offset += chunk_len;
+        }
+        Ok(())
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
@@ -391,9 +516,7 @@ where
             }
         }
     };
-    let (upload, download) = tokio::join!(upload, download);
-    upload?;
-    download?;
+    tokio::try_join!(upload, download)?;
     Ok(())
 }
 
@@ -424,6 +547,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn noise_frame_transport_round_trips_record_boundaries() {
+        for size in [
+            0usize,
+            1,
+            NOISE_CHUNK - HEADER_LEN - 1,
+            NOISE_CHUNK - HEADER_LEN,
+            NOISE_CHUNK - HEADER_LEN + 1,
+            NOISE_CHUNK * 2,
+        ] {
+            let (mut left, mut right) = tokio::io::duplex(512 * 1024);
+            let psk = [13u8; 32];
+            let (initiator, responder) = tokio::join!(
+                noise_initiator(&mut left, &psk, b"boundary-test"),
+                noise_responder(&mut right, &psk, b"boundary-test"),
+            );
+            let payload = vec![0x3cu8; size];
+            let mut writer = SecureFrameWriter::new(&mut left, Some(initiator.unwrap()));
+            let mut reader = SecureFrameReader::new(&mut right, Some(responder.unwrap()));
+            let (sent, received) = tokio::join!(
+                writer.write_raw(FrameKind::FileChunk, 88, &payload),
+                reader.read_frame(),
+            );
+            sent.unwrap();
+            let frame = received.unwrap();
+            assert_eq!(frame.stream_id, 88);
+            assert_eq!(frame.payload, payload);
+        }
+    }
+
+    #[tokio::test]
     async fn noise_frame_transport_round_trips_large_frame() {
         let (mut left, mut right) = tokio::io::duplex(512 * 1024);
         let psk = [7u8; 32];
@@ -435,7 +588,7 @@ mod tests {
         let initiator = initiator.unwrap();
         let responder = responder.unwrap();
         let payload = vec![0x5au8; 170 * 1024];
-        let outgoing = raw_frame(FrameKind::FileChunk, 77, payload.clone());
+        let outgoing = crate::raw_frame(FrameKind::FileChunk, 77, payload.clone());
         {
             let mut writer = SecureFrameWriter::new(&mut left, Some(initiator));
             writer.write_frame(&outgoing).await.unwrap();
@@ -447,6 +600,62 @@ mod tests {
         assert_eq!(incoming.kind, FrameKind::FileChunk);
         assert_eq!(incoming.stream_id, 77);
         assert_eq!(incoming.payload, payload);
+    }
+
+    struct FailingTunnelIo;
+
+    impl AsyncRead for FailingTunnelIo {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for FailingTunnelIo {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn noise_tunnel_propagates_write_error() {
+        let (mut left, mut right) = tokio::io::duplex(4096);
+        let psk = [11u8; 32];
+        let (left_noise, right_noise) = tokio::join!(
+            noise_initiator(&mut left, &psk, b"tunnel-error"),
+            noise_responder(&mut right, &psk, b"tunnel-error"),
+        );
+        drop(right_noise.unwrap());
+        let noise = left_noise.unwrap();
+        let (mut client, mut plain) = tokio::io::duplex(64);
+        client.write_all(b"data").await.unwrap();
+        let mut failing = FailingTunnelIo;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            copy_noise_tunnel(&mut plain, &mut failing, noise),
+        )
+        .await
+        .expect("tunnel did not propagate write failure");
+        assert!(result.is_err());
     }
 
     #[tokio::test]

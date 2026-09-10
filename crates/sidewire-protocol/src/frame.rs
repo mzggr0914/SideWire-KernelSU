@@ -127,7 +127,11 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
     postcard::from_bytes(bytes).context("deserialize protocol payload")
 }
 
-fn frame_header(kind: FrameKind, stream_id: u32, payload_len: usize) -> Result<[u8; HEADER_LEN]> {
+pub(crate) fn frame_header(
+    kind: FrameKind,
+    stream_id: u32,
+    payload_len: usize,
+) -> Result<[u8; HEADER_LEN]> {
     if payload_len > MAX_PAYLOAD {
         bail!("payload too large: {payload_len} bytes");
     }
@@ -138,6 +142,23 @@ fn frame_header(kind: FrameKind, stream_id: u32, payload_len: usize) -> Result<[
     header[8..12].copy_from_slice(&stream_id.to_be_bytes());
     header[12..16].copy_from_slice(&(payload_len as u32).to_be_bytes());
     Ok(header)
+}
+
+pub(crate) fn decode_frame_header(header: &[u8; HEADER_LEN]) -> Result<(FrameKind, u32, usize)> {
+    if header[0..4] != MAGIC {
+        bail!("invalid SideWire frame magic");
+    }
+    let version = u16::from_be_bytes([header[4], header[5]]);
+    if !protocol_compatible(version) {
+        bail!("unsupported protocol version {}", protocol_label(version));
+    }
+    let kind = FrameKind::try_from(u16::from_be_bytes([header[6], header[7]]))?;
+    let stream_id = u32::from_be_bytes(header[8..12].try_into().unwrap());
+    let payload_len = u32::from_be_bytes(header[12..16].try_into().unwrap()) as usize;
+    if payload_len > MAX_PAYLOAD {
+        bail!("payload too large: {payload_len} bytes");
+    }
+    Ok((kind, stream_id, payload_len))
 }
 
 pub fn encode_frame_bytes(frame: &Frame) -> Result<Vec<u8>> {
@@ -152,20 +173,8 @@ pub fn decode_frame_bytes(bytes: &[u8]) -> Result<Frame> {
     if bytes.len() < HEADER_LEN {
         bail!("truncated SideWire frame");
     }
-    let header = &bytes[..HEADER_LEN];
-    if header[0..4] != MAGIC {
-        bail!("invalid SideWire frame magic");
-    }
-    let version = u16::from_be_bytes([header[4], header[5]]);
-    if !protocol_compatible(version) {
-        bail!("unsupported protocol version {}", protocol_label(version));
-    }
-    let kind = FrameKind::try_from(u16::from_be_bytes([header[6], header[7]]))?;
-    let stream_id = u32::from_be_bytes(header[8..12].try_into().unwrap());
-    let payload_len = u32::from_be_bytes(header[12..16].try_into().unwrap()) as usize;
-    if payload_len > MAX_PAYLOAD {
-        bail!("payload too large: {payload_len} bytes");
-    }
+    let header: &[u8; HEADER_LEN] = bytes[..HEADER_LEN].try_into().unwrap();
+    let (kind, stream_id, payload_len) = decode_frame_header(header)?;
     if bytes.len() != HEADER_LEN + payload_len {
         bail!("invalid SideWire frame length");
     }
@@ -216,19 +225,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
     let mut header = [0u8; HEADER_LEN];
     reader.read_exact(&mut header).await?;
-    if header[0..4] != MAGIC {
-        bail!("invalid SideWire frame magic");
-    }
-    let version = u16::from_be_bytes([header[4], header[5]]);
-    if !protocol_compatible(version) {
-        bail!("unsupported protocol version {}", protocol_label(version));
-    }
-    let kind = FrameKind::try_from(u16::from_be_bytes([header[6], header[7]]))?;
-    let stream_id = u32::from_be_bytes(header[8..12].try_into().unwrap());
-    let payload_len = u32::from_be_bytes(header[12..16].try_into().unwrap()) as usize;
-    if payload_len > MAX_PAYLOAD {
-        bail!("payload too large: {payload_len} bytes");
-    }
+    let (kind, stream_id, payload_len) = decode_frame_header(&header)?;
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload).await?;
     Ok(Frame {
