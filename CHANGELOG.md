@@ -7,6 +7,7 @@
 - reduce transport hot-path contention by removing async locks from per-frame stream routing
 - harden stream cancellation, writer shutdown, and secure-frame buffering under stalled or canceled transfers
 - reduce Android outbound idle overhead with handshake-aware reconnect backoff, rate-limited failure logs, and startup log trimming
+- keep the Android clipboard helper persistent across requests to avoid repeated `app_process`/JVM startup overhead
 
 ## 0.9.9
 

@@ -18,10 +18,12 @@ use std::{
     process::Stdio,
     sync::{Arc, Mutex as StdMutex},
 };
+mod clipboard;
 mod completion;
 mod security;
 mod transport;
 
+use clipboard::{ClipboardHelperManager, SharedClipboardHelper};
 use transport::MuxWriter;
 
 const FILE_BUFFER_SIZE: usize = 256 * 1024;
@@ -192,6 +194,13 @@ async fn main() -> Result<()> {
         "SideWire configuration loaded"
     );
     let reconnect = Arc::new(Notify::new());
+    let clipboard = resolved
+        .clipboard_helper
+        .clone()
+        .and_then(ClipboardHelperManager::shared);
+    if resolved.clipboard_helper.is_some() && clipboard.is_none() {
+        tracing::warn!("clipboard helper is configured but unavailable");
+    }
     let pairing = match (resolved.pairing_file.clone(), resolved.pairs_dir.clone()) {
         (Some(pairing_file), Some(pairs_dir)) => Some(security::run_pairing_listener(
             resolved.pairing_port,
@@ -212,7 +221,7 @@ async fn main() -> Result<()> {
                     resolved.device_id,
                     resolved.security,
                     resolved.pairs_dir.clone(),
-                    resolved.clipboard_helper.clone(),
+                    clipboard.clone(),
                 )
                 .await
             }
@@ -223,7 +232,7 @@ async fn main() -> Result<()> {
                     resolved.device_id,
                     resolved.security,
                     resolved.pairs_dir.clone(),
-                    resolved.clipboard_helper.clone(),
+                    clipboard.clone(),
                     reconnect.clone(),
                 )
                 .await
@@ -245,7 +254,7 @@ async fn run_inbound(
     device_id: DeviceId,
     security: SecurityMode,
     pairs_dir: Option<String>,
-    clipboard_helper: Option<String>,
+    clipboard: Option<SharedClipboardHelper>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind)
         .await
@@ -265,7 +274,7 @@ async fn run_inbound(
         stream.set_nodelay(true).context("enable TCP_NODELAY")?;
         let name = name.to_owned();
         let pairs_dir = pairs_dir.clone();
-        let clipboard_helper = clipboard_helper.clone();
+        let clipboard = clipboard.clone();
         tracing::info!(%peer, "host connected");
         tokio::spawn(async move {
             if let Err(error) = serve(
@@ -276,7 +285,7 @@ async fn run_inbound(
                     inbound: true,
                     security_mode: security,
                     pairs_dir,
-                    clipboard_helper,
+                    clipboard,
                     established: None,
                 },
             )
@@ -349,7 +358,7 @@ async fn run_outbound(
     device_id: DeviceId,
     security: SecurityMode,
     pairs_dir: Option<String>,
-    clipboard_helper: Option<String>,
+    clipboard: Option<SharedClipboardHelper>,
     reconnect: Arc<Notify>,
 ) -> Result<()> {
     let mut delay = 1u64;
@@ -375,7 +384,7 @@ async fn run_outbound(
                         inbound: false,
                         security_mode: security,
                         pairs_dir: pairs_dir.clone(),
-                        clipboard_helper: clipboard_helper.clone(),
+                        clipboard: clipboard.clone(),
                         established: Some(established_tx),
                     },
                 )
@@ -465,14 +474,14 @@ async fn wait_for_stream_cancel(cancel: &mut tokio::sync::watch::Receiver<bool>)
     }
 }
 
-fn daemon_capabilities(clipboard_helper: Option<&str>) -> u64 {
+fn daemon_capabilities(clipboard: Option<&SharedClipboardHelper>) -> u64 {
     let mut capabilities = sidewire_protocol::capabilities::CORE
         | sidewire_protocol::capabilities::PTY_COMPLETION
         | sidewire_protocol::capabilities::SECURE_PROXY
         | sidewire_protocol::capabilities::HEARTBEAT
         | sidewire_protocol::capabilities::STREAM_CANCEL
         | sidewire_protocol::capabilities::FLOW_CONTROL;
-    if clipboard_helper.is_some_and(|path| std::path::Path::new(path).is_file()) {
+    if clipboard.is_some() {
         capabilities |= sidewire_protocol::capabilities::CLIPBOARD;
     }
     capabilities
@@ -484,7 +493,7 @@ struct ServeOptions {
     inbound: bool,
     security_mode: SecurityMode,
     pairs_dir: Option<String>,
-    clipboard_helper: Option<String>,
+    clipboard: Option<SharedClipboardHelper>,
     established: Option<oneshot::Sender<()>>,
 }
 
@@ -495,10 +504,10 @@ async fn serve(mut stream: TcpStream, options: ServeOptions) -> Result<()> {
         inbound,
         security_mode,
         pairs_dir,
-        clipboard_helper,
+        clipboard,
         mut established,
     } = options;
-    let local_capabilities = daemon_capabilities(clipboard_helper.as_deref());
+    let local_capabilities = daemon_capabilities(clipboard.as_ref());
     let (noise, shared_secret, peer_capabilities, negotiated_protocol) = tokio::time::timeout(
         Duration::from_secs(CONNECTION_SETUP_TIMEOUT_SECS),
         async {
@@ -729,15 +738,20 @@ async fn serve(mut stream: TcpStream, options: ServeOptions) -> Result<()> {
                     });
                 }
                 FrameKind::ClipboardGet => {
-                    let cancel = register_cancel(&cancels, stream_id).await?;
+                    let mut cancel = register_cancel(&cancels, stream_id).await?;
                     let writer = writer.clone();
-                    let helper = clipboard_helper.clone();
+                    let clipboard = clipboard.clone();
                     let cancels = cancels.clone();
                     tokio::spawn(async move {
                         let result: Result<()> = async {
-                            let helper =
-                                helper.context("clipboard helper is unavailable on this device")?;
-                            let text = run_clipboard_helper(&helper, "get", None, cancel).await?;
+                            let clipboard = clipboard
+                                .context("clipboard helper is unavailable on this device")?;
+                            let mut manager = tokio::select! {
+                                biased;
+                                _ = wait_for_stream_cancel(&mut cancel) => bail!("clipboard stream canceled"),
+                                manager = clipboard.lock() => manager,
+                            };
+                            let text = manager.get(&mut cancel).await?;
                             writer
                                 .send(&frame(
                                     FrameKind::ClipboardData,
@@ -755,20 +769,24 @@ async fn serve(mut stream: TcpStream, options: ServeOptions) -> Result<()> {
                     });
                 }
                 FrameKind::ClipboardSet => {
-                    let cancel = register_cancel(&cancels, stream_id).await?;
+                    let mut cancel = register_cancel(&cancels, stream_id).await?;
                     let writer = writer.clone();
-                    let helper = clipboard_helper.clone();
+                    let clipboard = clipboard.clone();
                     let cancels = cancels.clone();
                     tokio::spawn(async move {
                         let result: Result<()> = async {
-                            let helper =
-                                helper.context("clipboard helper is unavailable on this device")?;
+                            let clipboard = clipboard
+                                .context("clipboard helper is unavailable on this device")?;
                             let request: ClipboardSetRequest = decode(&request.payload)?;
                             if request.text.len() > MAX_CLIPBOARD_TEXT {
                                 bail!("clipboard text exceeds 4 MiB limit");
                             }
-                            run_clipboard_helper(&helper, "set", Some(&request.text), cancel)
-                                .await?;
+                            let mut manager = tokio::select! {
+                                biased;
+                                _ = wait_for_stream_cancel(&mut cancel) => bail!("clipboard stream canceled"),
+                                manager = clipboard.lock() => manager,
+                            };
+                            manager.set(&request.text, &mut cancel).await?;
                             writer
                                 .send(&frame(
                                     FrameKind::ClipboardData,
@@ -786,15 +804,20 @@ async fn serve(mut stream: TcpStream, options: ServeOptions) -> Result<()> {
                     });
                 }
                 FrameKind::ClipboardClear => {
-                    let cancel = register_cancel(&cancels, stream_id).await?;
+                    let mut cancel = register_cancel(&cancels, stream_id).await?;
                     let writer = writer.clone();
-                    let helper = clipboard_helper.clone();
+                    let clipboard = clipboard.clone();
                     let cancels = cancels.clone();
                     tokio::spawn(async move {
                         let result: Result<()> = async {
-                            let helper =
-                                helper.context("clipboard helper is unavailable on this device")?;
-                            run_clipboard_helper(&helper, "clear", None, cancel).await?;
+                            let clipboard = clipboard
+                                .context("clipboard helper is unavailable on this device")?;
+                            let mut manager = tokio::select! {
+                                biased;
+                                _ = wait_for_stream_cancel(&mut cancel) => bail!("clipboard stream canceled"),
+                                manager = clipboard.lock() => manager,
+                            };
+                            manager.clear(&mut cancel).await?;
                             writer
                                 .send(&frame(
                                     FrameKind::ClipboardData,
@@ -900,62 +923,6 @@ async fn send_ack(
     writer
         .write_frame(&frame(FrameKind::HelloAck, 0, &ack)?)
         .await
-}
-
-async fn run_clipboard_helper(
-    helper: &str,
-    operation: &str,
-    input: Option<&str>,
-    mut cancel: tokio::sync::watch::Receiver<bool>,
-) -> Result<String> {
-    if !std::path::Path::new(helper).is_file() {
-        bail!("clipboard helper not found at {helper}");
-    }
-    let args = vec![
-        "/system/bin".to_owned(),
-        "com.sidewire.ClipboardHelper".to_owned(),
-        operation.to_owned(),
-    ];
-    let mut command = command_for_identity("/system/bin/app_process", &args, ExecIdentity::Shell);
-    command
-        .env("CLASSPATH", helper)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn().context("start Android clipboard helper")?;
-    if let Some(text) = input {
-        let mut stdin = child.stdin.take().context("open clipboard helper stdin")?;
-        tokio::select! {
-            biased;
-            _ = cancel.changed() => bail!("clipboard stream canceled"),
-            result = stdin.write_all(text.as_bytes()) => result?,
-        }
-        tokio::select! {
-            biased;
-            _ = cancel.changed() => bail!("clipboard stream canceled"),
-            result = stdin.shutdown() => result?,
-        }
-    }
-    let output = tokio::select! {
-        biased;
-        _ = cancel.changed() => bail!("clipboard stream canceled"),
-        result = child.wait_with_output() => result?,
-    };
-    if !output.status.success() {
-        bail!(
-            "Android clipboard helper failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    if output.stdout.len() > MAX_CLIPBOARD_TEXT {
-        bail!("Android clipboard text exceeds 4 MiB limit");
-    }
-    String::from_utf8(output.stdout).context("Android clipboard is not valid UTF-8")
 }
 
 #[cfg(target_os = "android")]
