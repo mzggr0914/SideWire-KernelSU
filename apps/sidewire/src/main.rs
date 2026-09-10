@@ -140,6 +140,9 @@ enum Command {
         all: bool,
         #[arg(long = "as", value_enum)]
         run_as: Option<RunAs>,
+        /// Maximum concurrent files for recursive transfers.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=16))]
+        jobs: u8,
         local: PathBuf,
         remote: String,
     },
@@ -148,6 +151,9 @@ enum Command {
         device: Option<String>,
         #[arg(long = "as", value_enum)]
         run_as: Option<RunAs>,
+        /// Maximum concurrent files for recursive transfers.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=16))]
+        jobs: u8,
         remote: String,
         local: PathBuf,
     },
@@ -341,6 +347,7 @@ async fn main() -> Result<()> {
             device,
             all,
             run_as,
+            jobs,
             local,
             remote,
         } => {
@@ -349,12 +356,13 @@ async fn main() -> Result<()> {
             }
             let run_as = config::resolve_run_as(&app_config, run_as, RunAs::Shell);
             if all {
-                transfer::run_push_all(&control, run_as, local, remote).await
+                transfer::run_push_all(&control, run_as, jobs as usize, local, remote).await
             } else {
                 transfer::run_push(
                     &control,
                     config::resolve_device(&app_config, device),
                     run_as,
+                    jobs as usize,
                     local,
                     remote,
                 )
@@ -364,6 +372,7 @@ async fn main() -> Result<()> {
         Command::Pull {
             device,
             run_as,
+            jobs,
             remote,
             local,
         } => {
@@ -371,6 +380,7 @@ async fn main() -> Result<()> {
                 &control,
                 config::resolve_device(&app_config, device),
                 config::resolve_run_as(&app_config, run_as, RunAs::Shell),
+                jobs as usize,
                 remote,
                 local,
             )

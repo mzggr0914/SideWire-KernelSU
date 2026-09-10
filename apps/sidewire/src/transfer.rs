@@ -2,6 +2,39 @@ use super::*;
 use crate::client::{exec_control, list_devices, request_control};
 use std::path::{Component, Path};
 
+const MAX_TRANSFER_JOBS: usize = 16;
+
+async fn join_transfer(
+    transfers: &mut tokio::task::JoinSet<Result<u64>>,
+    files: &mut u64,
+    bytes: &mut u64,
+) -> Result<()> {
+    let transferred = transfers
+        .join_next()
+        .await
+        .context("transfer task set ended unexpectedly")???;
+    *files += 1;
+    *bytes = bytes
+        .checked_add(transferred)
+        .context("transfer byte count overflow")?;
+    Ok(())
+}
+
+async fn drain_transfers(
+    transfers: &mut tokio::task::JoinSet<Result<u64>>,
+    files: &mut u64,
+    bytes: &mut u64,
+) -> Result<()> {
+    while !transfers.is_empty() {
+        join_transfer(transfers, files, bytes).await?;
+    }
+    Ok(())
+}
+
+fn transfer_jobs(jobs: usize) -> usize {
+    jobs.clamp(1, MAX_TRANSFER_JOBS)
+}
+
 fn absolute_output(path: PathBuf) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path)
@@ -165,9 +198,11 @@ async fn push_path(
     control: &str,
     device: Option<String>,
     run_as: RunAs,
+    jobs: usize,
     local: PathBuf,
     remote: String,
 ) -> Result<String> {
+    let jobs = transfer_jobs(jobs);
     let local = tokio::fs::canonicalize(local).await?;
     let metadata = tokio::fs::metadata(&local).await?;
     if metadata.is_file() {
@@ -194,6 +229,7 @@ async fn push_path(
     let mut files = 0u64;
     let mut bytes = 0u64;
     let mut directories = 1u64;
+    let mut transfers = tokio::task::JoinSet::new();
     while let Some(directory) = stack.pop() {
         let mut entries = tokio::fs::read_dir(&directory).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -209,11 +245,18 @@ async fn push_path(
                 directories += 1;
                 stack.push(path);
             } else if file_type.is_file() {
-                bytes += push_file(control, device.clone(), run_as, &path, remote_path).await?;
-                files += 1;
+                while transfers.len() >= jobs {
+                    join_transfer(&mut transfers, &mut files, &mut bytes).await?;
+                }
+                let control = control.to_owned();
+                let device = device.clone();
+                transfers.spawn(async move {
+                    push_file(&control, device, run_as, &path, remote_path).await
+                });
             }
         }
     }
+    drain_transfers(&mut transfers, &mut files, &mut bytes).await?;
     Ok(format!(
         "pushed {files} files in {directories} directories ({bytes} bytes)"
     ))
@@ -223,12 +266,13 @@ pub(super) async fn run_push(
     control: &str,
     device: Option<String>,
     run_as: RunAs,
+    jobs: usize,
     local: PathBuf,
     remote: String,
 ) -> Result<()> {
     println!(
         "{}",
-        push_path(control, device, run_as, local, remote).await?
+        push_path(control, device, run_as, jobs, local, remote).await?
     );
     Ok(())
 }
@@ -236,6 +280,7 @@ pub(super) async fn run_push(
 pub(super) async fn run_push_all(
     control: &str,
     run_as: RunAs,
+    jobs: usize,
     local: PathBuf,
     remote: String,
 ) -> Result<()> {
@@ -249,7 +294,15 @@ pub(super) async fn run_push_all(
         let local = local.clone();
         let remote = remote.clone();
         tasks.spawn(async move {
-            let result = push_path(&control, Some(device.id.clone()), run_as, local, remote).await;
+            let result = push_path(
+                &control,
+                Some(device.id.clone()),
+                run_as,
+                jobs,
+                local,
+                remote,
+            )
+            .await;
             (device, result)
         });
     }
@@ -274,9 +327,11 @@ pub(super) async fn run_pull(
     control: &str,
     device: Option<String>,
     run_as: RunAs,
+    jobs: usize,
     remote: String,
     local: PathBuf,
 ) -> Result<()> {
+    let jobs = transfer_jobs(jobs);
     let local = absolute_output(local)?;
     if !remote_is_dir(control, device.clone(), run_as, &remote).await? {
         let bytes = pull_file(control, device, run_as, remote, &local).await?;
@@ -294,12 +349,23 @@ pub(super) async fn run_pull(
     let remote_files = remote_find(control, device.clone(), run_as, &remote, "f").await?;
     let mut files = 0u64;
     let mut bytes = 0u64;
+    let mut transfers = tokio::task::JoinSet::new();
     for remote_file in remote_files {
         let relative = local_relative(&remote, &remote_file)?;
         let local_file = local.join(relative);
-        bytes += pull_file(control, device.clone(), run_as, remote_file, &local_file).await?;
-        files += 1;
+        if let Some(parent) = local_file.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        while transfers.len() >= jobs {
+            join_transfer(&mut transfers, &mut files, &mut bytes).await?;
+        }
+        let control = control.to_owned();
+        let device = device.clone();
+        transfers.spawn(async move {
+            pull_file(&control, device, run_as, remote_file, &local_file).await
+        });
     }
+    drain_transfers(&mut transfers, &mut files, &mut bytes).await?;
 
     println!(
         "pulled {files} files in {} directories ({bytes} bytes)",
