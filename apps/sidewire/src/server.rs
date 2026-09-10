@@ -13,6 +13,9 @@ const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 10;
 const HEARTBEAT_MAX_MISSES: u32 = 3;
+const CONNECT_TIMEOUT_SECS: u64 = 5;
+const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const MAX_PENDING_HANDSHAKES: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 enum ConnectionMode {
@@ -199,40 +202,55 @@ async fn device_listener(bind: &str, devices: DeviceMap, security: SecurityMode)
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind device listener {bind}"))?;
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
     tracing::info!(%bind, "waiting for outbound SideWire devices");
     loop {
         let (mut stream, peer) = listener.accept().await?;
         stream.set_nodelay(true).context("enable TCP_NODELAY")?;
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            tracing::warn!(%peer, "too many pending device handshakes");
+            continue;
+        };
+        let devices = devices.clone();
         let peer_text = peer.to_string();
         let device_ip = peer.ip();
         let local_ip = stream.local_addr()?.ip();
-        match accept_device(&mut stream, security).await {
-            Ok(identity) => {
-                let transport = DeviceTransport::new(
-                    stream,
-                    identity.noise.clone(),
-                    identity.protocol,
-                    identity.capabilities,
-                );
-                let session = DeviceSession {
-                    id: identity.id,
-                    name: identity.name,
-                    peer: peer_text,
-                    mode: ConnectionMode::Outbound,
-                    device_ip,
-                    local_ip,
-                    transport: transport.clone(),
-                    security: identity.security,
-                    shared_secret: identity.shared_secret,
-                    capabilities: identity.capabilities,
-                    protocol: identity.protocol,
-                };
-                if let Err(error) = register_device(&devices, session).await {
-                    tracing::warn!(%peer, %error, "outbound device rejected");
+        tokio::spawn(async move {
+            let _permit = permit;
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                accept_device(&mut stream, security),
+            )
+            .await
+            {
+                Ok(Ok(identity)) => {
+                    let transport = DeviceTransport::new(
+                        stream,
+                        identity.noise.clone(),
+                        identity.protocol,
+                        identity.capabilities,
+                    );
+                    let session = DeviceSession {
+                        id: identity.id,
+                        name: identity.name,
+                        peer: peer_text,
+                        mode: ConnectionMode::Outbound,
+                        device_ip,
+                        local_ip,
+                        transport: transport.clone(),
+                        security: identity.security,
+                        shared_secret: identity.shared_secret,
+                        capabilities: identity.capabilities,
+                        protocol: identity.protocol,
+                    };
+                    if let Err(error) = register_device(&devices, session).await {
+                        tracing::warn!(%peer, %error, "outbound device rejected");
+                    }
                 }
+                Ok(Err(error)) => tracing::warn!(%peer, %error, "device handshake failed"),
+                Err(_) => tracing::warn!(%peer, "device handshake timed out"),
             }
-            Err(error) => tracing::warn!(%peer, %error, "device handshake failed"),
-        }
+        });
     }
 }
 
@@ -593,13 +611,22 @@ async fn connect_endpoint_once(
     security: SecurityMode,
 ) -> Result<()> {
     tracing::info!(%endpoint, "connecting to inbound SideWire device");
-    let mut stream = TcpStream::connect(endpoint)
-        .await
-        .with_context(|| format!("connect inbound device {endpoint}"))?;
+    let mut stream = tokio::time::timeout(
+        tokio::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        TcpStream::connect(endpoint),
+    )
+    .await
+    .with_context(|| format!("timed out connecting inbound device {endpoint}"))?
+    .with_context(|| format!("connect inbound device {endpoint}"))?;
     stream.set_nodelay(true).context("enable TCP_NODELAY")?;
     let peer = stream.peer_addr()?;
     let local = stream.local_addr()?;
-    let identity = connect_device(&mut stream, security).await?;
+    let identity = tokio::time::timeout(
+        tokio::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        connect_device(&mut stream, security),
+    )
+    .await
+    .context("inbound device handshake timed out")??;
     if let Some(expected) = expected_id
         && identity.id != expected
     {
@@ -1239,14 +1266,14 @@ async fn resolve_device(
 }
 
 async fn remove_device_if_same(devices: &DeviceMap, id: DeviceId, session: &DeviceSession) {
-    let should_remove = devices
-        .read()
-        .await
+    let mut guard = devices.write().await;
+    let should_remove = guard
         .get(&id)
         .map(|current| current.transport.same_connection(&session.transport))
         .unwrap_or(false);
     if should_remove {
-        devices.write().await.remove(&id);
+        guard.remove(&id);
+        drop(guard);
         tracing::info!(device = %session.name, device_id = %id.short(), "device disconnected");
     }
 }
