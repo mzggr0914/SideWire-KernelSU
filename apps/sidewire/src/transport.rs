@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use sidewire_protocol::{
     Frame, FrameKind, SecureFrameReader, SecureFrameWriter, SharedNoise, capabilities,
-    protocol_minor,
+    protocol_minor, raw_frame,
 };
 use std::{
     collections::HashMap,
@@ -11,11 +11,12 @@ use std::{
     },
 };
 use tokio::{
-    net::{TcpStream, tcp::OwnedWriteHalf},
-    sync::{Mutex, Notify, mpsc, watch},
+    net::TcpStream,
+    sync::{Mutex, Notify, mpsc, oneshot, watch},
 };
 
 const ROUTE_CAPACITY: usize = 16;
+const WRITER_QUEUE_CAPACITY: usize = 16;
 const STREAM_CANCEL_PROTOCOL_MINOR: u8 = 1;
 
 #[derive(Clone)]
@@ -29,11 +30,17 @@ struct RouteSender {
     cancel: watch::Sender<Option<String>>,
 }
 
+struct WriterCommand {
+    frame: Frame,
+    done: oneshot::Sender<std::result::Result<(), String>>,
+}
+
 struct TransportInner {
-    writer: Mutex<SecureFrameWriter<OwnedWriteHalf>>,
+    writer: mpsc::Sender<WriterCommand>,
     routes: Mutex<HashMap<u32, RouteSender>>,
     next_stream_id: AtomicU32,
     closed: AtomicBool,
+    shutdown_notify: Notify,
     closed_notify: Notify,
     supports_stream_cancel: bool,
 }
@@ -43,16 +50,62 @@ pub(super) struct DeviceStream {
     transport: DeviceTransport,
     receiver: mpsc::Receiver<Frame>,
     cancel: watch::Receiver<Option<String>>,
+    completed: bool,
+}
+
+fn frame_completes_stream(kind: FrameKind) -> bool {
+    matches!(
+        kind,
+        FrameKind::ExecExit
+            | FrameKind::FileEnd
+            | FrameKind::PtyExit
+            | FrameKind::ClipboardData
+            | FrameKind::Pong
+            | FrameKind::ProxyStartAck
+            | FrameKind::Error
+    )
+}
+
+fn signal_closed(inner: &TransportInner) {
+    if !inner.closed.swap(true, Ordering::AcqRel) {
+        inner.shutdown_notify.notify_waiters();
+        inner.closed_notify.notify_waiters();
+    }
+}
+
+async fn enqueue_write(
+    inner: &Arc<TransportInner>,
+    frame: Frame,
+) -> Result<oneshot::Receiver<std::result::Result<(), String>>> {
+    if inner.closed.load(Ordering::Acquire) {
+        bail!("device connection is closed");
+    }
+    let (done, completed) = oneshot::channel();
+    inner
+        .writer
+        .send(WriterCommand { frame, done })
+        .await
+        .context("device connection writer stopped")?;
+    Ok(completed)
+}
+
+async fn queued_write(inner: &Arc<TransportInner>, frame: Frame) -> Result<()> {
+    match enqueue_write(inner, frame).await?.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => bail!(message),
+        Err(_) => bail!("device connection writer stopped"),
+    }
 }
 
 async fn send_stream_cancel(inner: Arc<TransportInner>, stream_id: u32, reason: String) {
     if !inner.supports_stream_cancel || inner.closed.load(Ordering::Acquire) {
         return;
     }
-    let mut writer = inner.writer.lock().await;
-    if let Err(error) = writer
-        .write_raw(FrameKind::StreamCancel, stream_id, reason.as_bytes())
-        .await
+    if let Err(error) = queued_write(
+        &inner,
+        raw_frame(FrameKind::StreamCancel, stream_id, reason.into_bytes()),
+    )
+    .await
     {
         tracing::debug!(stream_id, %error, "failed to send stream cancellation");
     }
@@ -65,14 +118,15 @@ impl DeviceTransport {
         protocol: u16,
         peer_capabilities: u64,
     ) -> Self {
-        let (reader, writer) = stream.into_split();
+        let (reader, writer_half) = stream.into_split();
         let mut reader = SecureFrameReader::new(reader, noise.clone());
-        let writer = SecureFrameWriter::new(writer, noise);
+        let (writer_tx, mut writer_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
         let inner = Arc::new(TransportInner {
-            writer: Mutex::new(writer),
+            writer: writer_tx,
             routes: Mutex::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
+            shutdown_notify: Notify::new(),
             closed_notify: Notify::new(),
             supports_stream_cancel: protocol_minor(protocol) >= STREAM_CANCEL_PROTOCOL_MINOR
                 && peer_capabilities & capabilities::STREAM_CANCEL != 0,
@@ -81,9 +135,57 @@ impl DeviceTransport {
             inner: inner.clone(),
         };
 
+        let writer_inner = inner.clone();
+        tokio::spawn(async move {
+            let mut writer = SecureFrameWriter::new(writer_half, noise);
+            loop {
+                let shutdown = writer_inner.shutdown_notify.notified();
+                if writer_inner.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                let command = tokio::select! {
+                    _ = shutdown => break,
+                    command = writer_rx.recv() => command,
+                };
+                let Some(WriterCommand { frame, done }) = command else {
+                    break;
+                };
+                let shutdown = writer_inner.shutdown_notify.notified();
+                let result = if writer_inner.closed.load(Ordering::Acquire) {
+                    Err(anyhow::anyhow!("device connection is closed"))
+                } else {
+                    tokio::select! {
+                        _ = shutdown => Err(anyhow::anyhow!("device connection is closed")),
+                        result = writer.write_frame(&frame) => result,
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        let _ = done.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let _ = done.send(Err(message));
+                        tracing::warn!(%error, "device transport writer ended");
+                        signal_closed(&writer_inner);
+                        break;
+                    }
+                }
+            }
+            signal_closed(&writer_inner);
+        });
+
         tokio::spawn(async move {
             loop {
-                let frame = match reader.read_frame().await {
+                let shutdown = inner.shutdown_notify.notified();
+                if inner.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                let incoming = tokio::select! {
+                    _ = shutdown => break,
+                    incoming = reader.read_frame() => incoming,
+                };
+                let frame = match incoming {
                     Ok(frame) => frame,
                     Err(error) => {
                         tracing::warn!(%error, "device transport reader ended");
@@ -133,9 +235,8 @@ impl DeviceTransport {
                     ),
                 }
             }
-            inner.closed.store(true, Ordering::Release);
+            signal_closed(&inner);
             inner.routes.lock().await.clear();
-            inner.closed_notify.notify_waiters();
         });
 
         transport
@@ -150,19 +251,12 @@ impl DeviceTransport {
     }
 
     pub(super) async fn close(&self) {
-        if !self.inner.closed.swap(true, Ordering::AcqRel) {
-            let mut writer = self.inner.writer.lock().await;
-            let _ = writer.shutdown().await;
-            self.inner.closed_notify.notify_waiters();
-        }
+        signal_closed(&self.inner);
+        self.inner.routes.lock().await.clear();
     }
 
     pub(super) async fn send_frame(&self, frame: &Frame) -> Result<()> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            bail!("device connection is closed");
-        }
-        let mut writer = self.inner.writer.lock().await;
-        writer.write_frame(frame).await
+        queued_write(&self.inner, frame.clone()).await
     }
 
     pub(super) async fn send_raw(
@@ -171,11 +265,7 @@ impl DeviceTransport {
         stream_id: u32,
         payload: &[u8],
     ) -> Result<()> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            bail!("device connection is closed");
-        }
-        let mut writer = self.inner.writer.lock().await;
-        writer.write_raw(kind, stream_id, payload).await
+        queued_write(&self.inner, raw_frame(kind, stream_id, payload.to_vec())).await
     }
 
     pub(super) async fn open_stream(&self) -> Result<DeviceStream> {
@@ -208,6 +298,7 @@ impl DeviceTransport {
                 transport: self.clone(),
                 receiver,
                 cancel,
+                completed: false,
             });
         }
     }
@@ -251,27 +342,32 @@ impl DeviceStream {
                 self.id
             );
         }
-        let mut writer = self.transport.inner.writer.lock().await;
+        let result = self.transport.send_frame(frame).await;
         self.ensure_active()?;
-        writer.write_frame(frame).await
+        result
     }
 
     pub(super) async fn send_raw(&self, kind: FrameKind, payload: &[u8]) -> Result<()> {
         self.ensure_active()?;
-        let mut writer = self.transport.inner.writer.lock().await;
+        let result = self.transport.send_raw(kind, self.id, payload).await;
         self.ensure_active()?;
-        writer.write_raw(kind, self.id, payload).await
+        result
     }
 
     pub(super) fn try_recv(&mut self) -> Result<Option<Frame>> {
         if let Some(reason) = self.cancel_reason() {
+            self.completed = true;
             bail!(reason);
         }
         match self.receiver.try_recv() {
-            Ok(frame) => Ok(Some(frame)),
+            Ok(frame) => {
+                self.completed |= frame_completes_stream(frame.kind);
+                Ok(Some(frame))
+            }
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 if let Some(reason) = self.cancel_reason() {
+                    self.completed = true;
                     bail!(reason);
                 }
                 bail!("device connection closed while stream was active")
@@ -281,25 +377,25 @@ impl DeviceStream {
 
     pub(super) async fn recv(&mut self) -> Result<Frame> {
         if let Some(reason) = self.cancel_reason() {
+            self.completed = true;
             bail!(reason);
         }
-        tokio::select! {
+        let frame = tokio::select! {
             biased;
             changed = self.cancel.changed() => {
                 if changed.is_ok()
                     && let Some(reason) = self.cancel_reason()
                 {
+                    self.completed = true;
                     bail!(reason);
                 }
-                self.receiver
-                    .recv()
-                    .await
-                    .context("device connection closed while stream was active")
+                self.receiver.recv().await
             }
-            frame = self.receiver.recv() => {
-                frame.context("device connection closed while stream was active")
-            }
+            frame = self.receiver.recv() => frame,
         }
+        .context("device connection closed while stream was active")?;
+        self.completed |= frame_completes_stream(frame.kind);
+        Ok(frame)
     }
 }
 
@@ -307,9 +403,18 @@ impl Drop for DeviceStream {
     fn drop(&mut self) {
         let transport = self.transport.clone();
         let id = self.id;
+        let completed = self.completed;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 transport.inner.routes.lock().await.remove(&id);
+                if !completed {
+                    send_stream_cancel(
+                        transport.inner.clone(),
+                        id,
+                        "local stream dropped before completion".to_owned(),
+                    )
+                    .await;
+                }
             });
         }
     }
@@ -317,8 +422,10 @@ impl Drop for DeviceStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceTransport, ROUTE_CAPACITY};
-    use sidewire_protocol::{FrameKind, SecureFrameWriter, VERSION, capabilities};
+    use super::{DeviceTransport, ROUTE_CAPACITY, enqueue_write};
+    use sidewire_protocol::{
+        FrameKind, SecureFrameReader, SecureFrameWriter, VERSION, capabilities, raw_frame,
+    };
     use tokio::{
         net::{TcpListener, TcpStream},
         time::{Duration, timeout},
@@ -329,6 +436,53 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
         (client.unwrap(), accepted.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn dropping_write_waiter_does_not_truncate_frame() {
+        let (client, server) = tcp_pair().await;
+        let transport = DeviceTransport::new(client, None, VERSION, capabilities::STREAM_CANCEL);
+        let payload = vec![0x5au8; 4 * 1024 * 1024];
+        let completed = enqueue_write(
+            &transport.inner,
+            raw_frame(FrameKind::FileChunk, 77, payload.clone()),
+        )
+        .await
+        .unwrap();
+        drop(completed);
+
+        let mut reader = SecureFrameReader::new(server, None);
+        let first = timeout(Duration::from_secs(5), reader.read_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.kind, FrameKind::FileChunk);
+        assert_eq!(first.stream_id, 77);
+        assert_eq!(first.payload, payload);
+        transport
+            .send_raw(FrameKind::Ping, 78, b"next")
+            .await
+            .unwrap();
+        let second = reader.read_frame().await.unwrap();
+        assert_eq!(second.kind, FrameKind::Ping);
+        assert_eq!(second.payload, b"next");
+    }
+
+    #[tokio::test]
+    async fn dropping_active_stream_notifies_remote() {
+        let (client, server) = tcp_pair().await;
+        let transport = DeviceTransport::new(client, None, VERSION, capabilities::STREAM_CANCEL);
+        let stream = transport.open_stream().await.unwrap();
+        let id = stream.id();
+        drop(stream);
+
+        let mut reader = SecureFrameReader::new(server, None);
+        let frame = timeout(Duration::from_secs(1), reader.read_frame())
+            .await
+            .expect("stream cancellation was not sent")
+            .unwrap();
+        assert_eq!(frame.kind, FrameKind::StreamCancel);
+        assert_eq!(frame.stream_id, id);
     }
 
     #[tokio::test]

@@ -23,10 +23,13 @@ const FILE_BUFFER_SIZE: usize = 256 * 1024;
 const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 const STREAM_ROUTE_CAPACITY: usize = 16;
 const HOST_SILENCE_TIMEOUT_SECS: u64 = 45;
+const CONNECT_TIMEOUT_SECS: u64 = 5;
+const CONNECTION_SETUP_TIMEOUT_SECS: u64 = 10;
 const STREAM_CANCEL_PROTOCOL_MINOR: u8 = 1;
 const MAX_CLIPBOARD_TEXT: usize = 4 * 1024 * 1024;
 
 type StreamRoutes = Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Frame>>>>;
+type StreamCancels = Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::watch::Sender<bool>>>>;
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -311,8 +314,13 @@ async fn run_outbound(
     let mut delay = 1u64;
     let mut pairing_grace = 0u8;
     loop {
-        match TcpStream::connect(server).await {
-            Ok(stream) => {
+        match tokio::time::timeout(
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            TcpStream::connect(server),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
                 stream.set_nodelay(true).context("enable TCP_NODELAY")?;
                 tracing::info!(%server, "connected to SideWire host");
                 if let Err(error) = serve(
@@ -330,7 +338,8 @@ async fn run_outbound(
                 }
                 delay = 1;
             }
-            Err(error) => tracing::warn!(%server, %error, "outbound connect failed"),
+            Ok(Err(error)) => tracing::warn!(%server, %error, "outbound connect failed"),
+            Err(_) => tracing::warn!(%server, "outbound connect timed out"),
         }
         tokio::select! {
             _ = sleep(Duration::from_secs(delay)) => {
@@ -367,6 +376,33 @@ async fn unregister_stream(routes: &StreamRoutes, stream_id: u32) {
     routes.lock().await.remove(&stream_id);
 }
 
+async fn register_cancel(
+    cancels: &StreamCancels,
+    stream_id: u32,
+) -> Result<tokio::sync::watch::Receiver<bool>> {
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    let mut cancels = cancels.lock().await;
+    if cancels.insert(stream_id, sender).is_some() {
+        bail!("stream {stream_id} already has a cancellation route");
+    }
+    Ok(receiver)
+}
+
+async fn unregister_cancel(cancels: &StreamCancels, stream_id: u32) {
+    cancels.lock().await.remove(&stream_id);
+}
+
+async fn wait_for_stream_cancel(cancel: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *cancel.borrow() {
+            return;
+        }
+        if cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 fn daemon_capabilities(clipboard_helper: Option<&str>) -> u64 {
     let mut capabilities = sidewire_protocol::capabilities::CORE
         | sidewire_protocol::capabilities::PTY_COMPLETION
@@ -389,6 +425,9 @@ async fn serve(
     clipboard_helper: Option<String>,
 ) -> Result<()> {
     let local_capabilities = daemon_capabilities(clipboard_helper.as_deref());
+    let (noise, shared_secret, peer_capabilities, negotiated_protocol) = tokio::time::timeout(
+        Duration::from_secs(CONNECTION_SETUP_TIMEOUT_SECS),
+        async {
     let secured = if inbound {
         security::accept_connection(&mut stream, device_id, security_mode, pairs_dir.as_deref())
             .await?
@@ -451,6 +490,11 @@ async fn serve(
         }
         (ack.capabilities, protocol)
     };
+    Ok::<_, anyhow::Error>((noise, shared_secret, peer_capabilities, negotiated_protocol))
+        },
+    )
+    .await
+    .context("SideWire connection handshake timed out")??;
     let negotiated_capabilities = local_capabilities & peer_capabilities;
     let supports_stream_cancel = sidewire_protocol::protocol_minor(negotiated_protocol)
         >= STREAM_CANCEL_PROTOCOL_MINOR
@@ -460,6 +504,7 @@ async fn serve(
     let mut reader = SecureFrameReader::new(reader_half, noise.clone());
     let writer = MuxWriter::new(writer_half, noise, supports_stream_cancel);
     let routes: StreamRoutes = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let cancels: StreamCancels = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let proxies = Arc::new(tokio::sync::Mutex::new(HashMap::<
         String,
         tokio::task::JoinHandle<()>,
@@ -468,24 +513,35 @@ async fn serve(
     let heartbeat = negotiated_capabilities & sidewire_protocol::capabilities::HEARTBEAT != 0;
     let result: Result<()> = async {
         loop {
-            let request = if heartbeat {
-                match tokio::time::timeout(
-                    Duration::from_secs(HOST_SILENCE_TIMEOUT_SECS),
-                    reader.read_frame(),
-                )
-                .await
-                {
-                    Ok(result) => result?,
-                    Err(_) => bail!("host heartbeat timeout"),
-                }
-            } else {
-                reader.read_frame().await?
+            let request = tokio::select! {
+                result = async {
+                    if heartbeat {
+                        match tokio::time::timeout(
+                            Duration::from_secs(HOST_SILENCE_TIMEOUT_SECS),
+                            reader.read_frame(),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => bail!("host heartbeat timeout"),
+                        }
+                    } else {
+                        reader.read_frame().await
+                    }
+                } => result?,
+                _ = writer.wait_failed() => bail!("device connection writer stopped"),
             };
             let stream_id = request.stream_id;
             if request.kind == FrameKind::StreamCancel {
                 writer.cancel_local(stream_id);
-                let removed = routes.lock().await.remove(&stream_id).is_some();
-                tracing::debug!(stream_id, routed = removed, "host canceled device stream");
+                let routed = routes.lock().await.remove(&stream_id).is_some();
+                let canceled = if let Some(cancel) = cancels.lock().await.remove(&stream_id) {
+                    let _ = cancel.send(true);
+                    true
+                } else {
+                    false
+                };
+                tracing::debug!(stream_id, routed, canceled, "host canceled device stream");
                 continue;
             }
 
@@ -512,34 +568,49 @@ async fn serve(
 
             match request.kind {
                 FrameKind::ExecRequest => {
+                    let cancel = register_cancel(&cancels, stream_id).await?;
                     let writer = writer.clone();
+                    let cancels = cancels.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_exec(&writer, stream_id, &request.payload).await
-                        {
+                        let result =
+                            handle_exec(&writer, stream_id, &request.payload, cancel).await;
+                        unregister_cancel(&cancels, stream_id).await;
+                        if let Err(error) = result {
                             writer.send_error(stream_id, error).await;
                         }
+                        writer.finish_stream(stream_id);
                     });
                 }
                 FrameKind::PushRequest => {
                     let mut inbox = register_stream(&routes, stream_id).await?;
+                    let cancel = register_cancel(&cancels, stream_id).await?;
                     let writer = writer.clone();
                     let routes = routes.clone();
+                    let cancels = cancels.clone();
                     tokio::spawn(async move {
                         let result =
-                            handle_push(&writer, stream_id, &request.payload, &mut inbox).await;
+                            handle_push(&writer, stream_id, &request.payload, &mut inbox, cancel)
+                                .await;
                         unregister_stream(&routes, stream_id).await;
+                        unregister_cancel(&cancels, stream_id).await;
                         if let Err(error) = result {
                             writer.send_error(stream_id, error).await;
                         }
+                        writer.finish_stream(stream_id);
                     });
                 }
                 FrameKind::PullRequest => {
+                    let cancel = register_cancel(&cancels, stream_id).await?;
                     let writer = writer.clone();
+                    let cancels = cancels.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_pull(&writer, stream_id, &request.payload).await
-                        {
+                        let result =
+                            handle_pull(&writer, stream_id, &request.payload, cancel).await;
+                        unregister_cancel(&cancels, stream_id).await;
+                        if let Err(error) = result {
                             writer.send_error(stream_id, error).await;
                         }
+                        writer.finish_stream(stream_id);
                     });
                 }
                 FrameKind::PtyOpen => {
@@ -560,16 +631,19 @@ async fn serve(
                         if let Err(error) = result {
                             writer.send_error(stream_id, error).await;
                         }
+                        writer.finish_stream(stream_id);
                     });
                 }
                 FrameKind::ClipboardGet => {
+                    let cancel = register_cancel(&cancels, stream_id).await?;
                     let writer = writer.clone();
                     let helper = clipboard_helper.clone();
+                    let cancels = cancels.clone();
                     tokio::spawn(async move {
                         let result: Result<()> = async {
                             let helper =
                                 helper.context("clipboard helper is unavailable on this device")?;
-                            let text = run_clipboard_helper(&helper, "get", None).await?;
+                            let text = run_clipboard_helper(&helper, "get", None, cancel).await?;
                             writer
                                 .send(&frame(
                                     FrameKind::ClipboardData,
@@ -579,14 +653,18 @@ async fn serve(
                                 .await
                         }
                         .await;
+                        unregister_cancel(&cancels, stream_id).await;
                         if let Err(error) = result {
                             writer.send_error(stream_id, error).await;
                         }
+                        writer.finish_stream(stream_id);
                     });
                 }
                 FrameKind::ClipboardSet => {
+                    let cancel = register_cancel(&cancels, stream_id).await?;
                     let writer = writer.clone();
                     let helper = clipboard_helper.clone();
+                    let cancels = cancels.clone();
                     tokio::spawn(async move {
                         let result: Result<()> = async {
                             let helper =
@@ -595,7 +673,8 @@ async fn serve(
                             if request.text.len() > MAX_CLIPBOARD_TEXT {
                                 bail!("clipboard text exceeds 4 MiB limit");
                             }
-                            run_clipboard_helper(&helper, "set", Some(&request.text)).await?;
+                            run_clipboard_helper(&helper, "set", Some(&request.text), cancel)
+                                .await?;
                             writer
                                 .send(&frame(
                                     FrameKind::ClipboardData,
@@ -605,19 +684,23 @@ async fn serve(
                                 .await
                         }
                         .await;
+                        unregister_cancel(&cancels, stream_id).await;
                         if let Err(error) = result {
                             writer.send_error(stream_id, error).await;
                         }
+                        writer.finish_stream(stream_id);
                     });
                 }
                 FrameKind::ClipboardClear => {
+                    let cancel = register_cancel(&cancels, stream_id).await?;
                     let writer = writer.clone();
                     let helper = clipboard_helper.clone();
+                    let cancels = cancels.clone();
                     tokio::spawn(async move {
                         let result: Result<()> = async {
                             let helper =
                                 helper.context("clipboard helper is unavailable on this device")?;
-                            run_clipboard_helper(&helper, "clear", None).await?;
+                            run_clipboard_helper(&helper, "clear", None, cancel).await?;
                             writer
                                 .send(&frame(
                                     FrameKind::ClipboardData,
@@ -627,50 +710,81 @@ async fn serve(
                                 .await
                         }
                         .await;
+                        unregister_cancel(&cancels, stream_id).await;
                         if let Err(error) = result {
                             writer.send_error(stream_id, error).await;
                         }
+                        writer.finish_stream(stream_id);
                     });
                 }
                 FrameKind::ProxyStartRequest => {
+                    let mut cancel = register_cancel(&cancels, stream_id).await?;
                     let writer = writer.clone();
                     let proxies = proxies.clone();
+                    let cancels = cancels.clone();
                     tokio::spawn(async move {
                         let result: Result<()> = async {
                             let req: ProxyStartRequest = decode(&request.payload)?;
-                            let (ack, task) = start_proxy(&req, shared_secret).await?;
-                            if let Some(old) = proxies.lock().await.insert(req.id.clone(), task) {
-                                old.abort();
-                            }
-                            writer
+                            let proxy_id = req.id.clone();
+                            let start = start_proxy(&req, shared_secret);
+                            tokio::pin!(start);
+                            let (ack, task) = tokio::select! {
+                                biased;
+                                _ = cancel.changed() => bail!("proxy start stream canceled"),
+                                result = &mut start => result?,
+                            };
+                            if let Err(error) = writer
                                 .send(&frame(FrameKind::ProxyStartAck, stream_id, &ack)?)
                                 .await
+                            {
+                                task.abort();
+                                return Err(error);
+                            }
+                            if let Some(old) = proxies.lock().await.insert(proxy_id, task) {
+                                old.abort();
+                            }
+                            Ok(())
                         }
                         .await;
+                        unregister_cancel(&cancels, stream_id).await;
                         if let Err(error) = result {
                             writer.send_error(stream_id, error).await;
                         }
+                        writer.finish_stream(stream_id);
                     });
                 }
                 FrameKind::Ping => {
                     writer
                         .send_raw(FrameKind::Pong, stream_id, &request.payload)
                         .await?;
+                    writer.finish_stream(stream_id);
                 }
                 kind => {
                     writer
                         .send_error(stream_id, format!("unsupported request {kind:?}"))
                         .await;
+                    writer.finish_stream(stream_id);
                 }
             }
         }
     }
     .await;
 
-    routes.lock().await.clear();
+    {
+        let mut routes = routes.lock().await;
+        for stream_id in routes.keys().copied().collect::<Vec<_>>() {
+            writer.cancel_local(stream_id);
+        }
+        routes.clear();
+    }
+    for (stream_id, cancel) in cancels.lock().await.drain() {
+        writer.cancel_local(stream_id);
+        let _ = cancel.send(true);
+    }
     for (_, task) in proxies.lock().await.drain() {
         task.abort();
     }
+    writer.close();
     result
 }
 async fn send_ack(
@@ -698,6 +812,7 @@ async fn run_clipboard_helper(
     helper: &str,
     operation: &str,
     input: Option<&str>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<String> {
     if !std::path::Path::new(helper).is_file() {
         bail!("clipboard helper not found at {helper}");
@@ -716,14 +831,27 @@ async fn run_clipboard_helper(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let mut child = command.spawn().context("start Android clipboard helper")?;
     if let Some(text) = input {
         let mut stdin = child.stdin.take().context("open clipboard helper stdin")?;
-        stdin.write_all(text.as_bytes()).await?;
-        stdin.shutdown().await?;
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => bail!("clipboard stream canceled"),
+            result = stdin.write_all(text.as_bytes()) => result?,
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => bail!("clipboard stream canceled"),
+            result = stdin.shutdown() => result?,
+        }
     }
-    let output = child.wait_with_output().await?;
+    let output = tokio::select! {
+        biased;
+        _ = cancel.changed() => bail!("clipboard stream canceled"),
+        result = child.wait_with_output() => result?,
+    };
     if !output.status.success() {
         bail!(
             "Android clipboard helper failed: {}",
@@ -787,7 +915,12 @@ fn command_for_identity(program: &str, args: &[String], identity: ExecIdentity) 
     command
 }
 
-async fn handle_exec(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Result<()> {
+async fn handle_exec(
+    writer: &MuxWriter,
+    stream_id: u32,
+    payload: &[u8],
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let request: ExecRequest = decode(payload)?;
     let mut command = command_for_identity(&request.program, &request.args, request.identity);
     command
@@ -808,12 +941,17 @@ async fn handle_exec(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Resu
     let mut stderr_buffer = vec![0u8; 64 * 1024];
     let mut stdout_done = false;
     let mut stderr_done = false;
-    let mut status = None;
-    let wait = child.wait();
-    tokio::pin!(wait);
 
-    while !stdout_done || !stderr_done || status.is_none() {
+    while !stdout_done || !stderr_done {
         tokio::select! {
+            biased;
+            changed = cancel.changed() => {
+                if changed.is_ok() && *cancel.borrow() {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    bail!("stream {stream_id} canceled");
+                }
+            }
             read = stdout.read(&mut stdout_buffer), if !stdout_done => {
                 let read = read?;
                 if read == 0 {
@@ -834,14 +972,12 @@ async fn handle_exec(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Resu
                         .await?;
                 }
             }
-            result = &mut wait, if status.is_none() => {
-                status = Some(result?);
-            }
         }
     }
 
+    let status = child.wait().await?;
     let exit = ExecExit {
-        code: status.and_then(|status| status.code()),
+        code: status.code(),
     };
     writer
         .send(&frame(FrameKind::ExecExit, stream_id, &exit)?)
@@ -888,6 +1024,7 @@ async fn handle_push(
     stream_id: u32,
     payload: &[u8],
     inbox: &mut tokio::sync::mpsc::Receiver<Frame>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let request: FilePushRequest = decode(payload)?;
     if matches!(request.identity, ExecIdentity::Root) {
@@ -902,10 +1039,12 @@ async fn handle_push(
             )?)
             .await?;
         loop {
-            let incoming = inbox
-                .recv()
-                .await
-                .context("device connection closed during push")?;
+            let incoming = tokio::select! {
+                biased;
+                _ = wait_for_stream_cancel(&mut cancel) => bail!("stream {stream_id} canceled"),
+                incoming = inbox.recv() => incoming
+                    .context("device connection closed during push")?,
+            };
             if incoming.stream_id != stream_id {
                 bail!("unexpected stream {} during push", incoming.stream_id);
             }
@@ -940,7 +1079,15 @@ async fn handle_push(
         .take()
         .context("push child stdout unavailable")?;
     let mut ready = [0u8; 1];
-    let readiness = child_stdout.read_exact(&mut ready).await;
+    let readiness = tokio::select! {
+        biased;
+        _ = wait_for_stream_cancel(&mut cancel) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            bail!("stream {stream_id} canceled");
+        }
+        readiness = child_stdout.read_exact(&mut ready) => readiness,
+    };
     drop(child_stdout);
     if readiness.is_err() || ready[0] != b'R' {
         drop(child_stdin);
@@ -963,10 +1110,12 @@ async fn handle_push(
 
     let transfer_result: Result<()> = async {
         loop {
-            let incoming = inbox
-                .recv()
-                .await
-                .context("device connection closed during push")?;
+            let incoming = tokio::select! {
+                biased;
+                _ = wait_for_stream_cancel(&mut cancel) => bail!("stream {stream_id} canceled"),
+                incoming = inbox.recv() => incoming
+                    .context("device connection closed during push")?,
+            };
             if incoming.stream_id != stream_id {
                 bail!("unexpected stream {} during push", incoming.stream_id);
             }
@@ -997,7 +1146,12 @@ async fn handle_push(
     Ok(())
 }
 
-async fn handle_pull(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Result<()> {
+async fn handle_pull(
+    writer: &MuxWriter,
+    stream_id: u32,
+    payload: &[u8],
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let request: FilePullRequest = decode(payload)?;
     if matches!(request.identity, ExecIdentity::Root) {
         let mut file = tokio::fs::File::open(&request.path)
@@ -1009,7 +1163,16 @@ async fn handle_pull(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Resu
             .await?;
         let mut buffer = vec![0u8; FILE_BUFFER_SIZE];
         loop {
-            let read = file.read(&mut buffer).await?;
+            let read = tokio::select! {
+                biased;
+                changed = cancel.changed() => {
+                    if changed.is_ok() && *cancel.borrow() {
+                        bail!("stream {stream_id} canceled");
+                    }
+                    continue;
+                }
+                read = file.read(&mut buffer) => read?,
+            };
             if read == 0 {
                 break;
             }
@@ -1045,7 +1208,18 @@ async fn handle_pull(writer: &MuxWriter, stream_id: u32, payload: &[u8]) -> Resu
         .await?;
     let mut buffer = vec![0u8; FILE_BUFFER_SIZE];
     loop {
-        let read = stdout.read(&mut buffer).await?;
+        let read = tokio::select! {
+            biased;
+            changed = cancel.changed() => {
+                if changed.is_ok() && *cancel.borrow() {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    bail!("stream {stream_id} canceled");
+                }
+                continue;
+            }
+            read = stdout.read(&mut buffer) => read?,
+        };
         if read == 0 {
             break;
         }
