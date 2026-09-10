@@ -62,6 +62,11 @@ pub struct FileMeta {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct StreamWindowUpdate {
+    pub bytes: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ProxyTokenMode {
     Expect,
     Send,

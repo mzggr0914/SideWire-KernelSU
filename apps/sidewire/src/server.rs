@@ -9,6 +9,8 @@ use sidewire_protocol::{
 use std::collections::HashSet;
 
 const FILE_BUFFER_SIZE: usize = 256 * 1024;
+const FILE_FLOW_WINDOW: usize = 1024 * 1024;
+const FILE_FLOW_UPDATE_THRESHOLD: usize = FILE_FLOW_WINDOW / 2;
 const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 10;
@@ -1501,13 +1503,20 @@ async fn remote_pull(
     let mut file = File::create(&path)
         .await
         .with_context(|| format!("create {}", path.display()))?;
+    stream.grant_window(FILE_FLOW_WINDOW).await?;
     let mut written = 0u64;
+    let mut window_consumed = 0usize;
     loop {
         let incoming = stream.recv().await?;
         match incoming.kind {
             FrameKind::FileChunk => {
                 file.write_all(&incoming.payload).await?;
                 written += incoming.payload.len() as u64;
+                window_consumed += incoming.payload.len();
+                if window_consumed >= FILE_FLOW_UPDATE_THRESHOLD {
+                    stream.grant_window(window_consumed).await?;
+                    window_consumed = 0;
+                }
             }
             FrameKind::FileEnd => break,
             FrameKind::Error => bail!(

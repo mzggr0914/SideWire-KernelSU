@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
 use sidewire_protocol::{
-    Frame, FrameKind, SecureFrameReader, SecureFrameWriter, SharedNoise, capabilities,
-    protocol_minor, raw_frame,
+    Frame, FrameKind, SecureFrameReader, SecureFrameWriter, SharedNoise, StreamWindowUpdate,
+    capabilities, decode, frame, protocol_minor, raw_frame,
 };
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
@@ -18,16 +18,59 @@ use tokio::{
 const ROUTE_CAPACITY: usize = 16;
 const WRITER_QUEUE_CAPACITY: usize = 16;
 const STREAM_CANCEL_PROTOCOL_MINOR: u8 = 1;
+const FLOW_CONTROL_PROTOCOL_MINOR: u8 = 2;
+const MAX_FLOW_CREDIT: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(super) struct DeviceTransport {
     inner: Arc<TransportInner>,
 }
 
+struct FlowCredit {
+    available: StdMutex<usize>,
+    notify: Notify,
+}
+
+impl FlowCredit {
+    fn new() -> Self {
+        Self {
+            available: StdMutex::new(0),
+            notify: Notify::new(),
+        }
+    }
+
+    fn add(&self, bytes: usize) -> Result<()> {
+        if bytes == 0 {
+            bail!("stream window update must grant at least one byte");
+        }
+        let mut available = self.available.lock().unwrap();
+        let updated = available
+            .checked_add(bytes)
+            .context("stream flow credit overflow")?;
+        if updated > MAX_FLOW_CREDIT {
+            bail!("stream flow credit exceeds {MAX_FLOW_CREDIT} bytes");
+        }
+        *available = updated;
+        drop(available);
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    fn try_take(&self, bytes: usize) -> bool {
+        let mut available = self.available.lock().unwrap();
+        if *available < bytes {
+            return false;
+        }
+        *available -= bytes;
+        true
+    }
+}
+
 #[derive(Clone)]
 struct RouteSender {
     sender: mpsc::Sender<Frame>,
     cancel: watch::Sender<Option<String>>,
+    flow: Option<Arc<FlowCredit>>,
 }
 
 struct WriterCommand {
@@ -43,6 +86,7 @@ struct TransportInner {
     shutdown_notify: Notify,
     closed_notify: Notify,
     supports_stream_cancel: bool,
+    supports_flow_control: bool,
 }
 
 pub(super) struct DeviceStream {
@@ -50,6 +94,7 @@ pub(super) struct DeviceStream {
     transport: DeviceTransport,
     receiver: mpsc::Receiver<Frame>,
     cancel: watch::Receiver<Option<String>>,
+    flow: Option<Arc<FlowCredit>>,
     completed: bool,
 }
 
@@ -130,6 +175,8 @@ impl DeviceTransport {
             closed_notify: Notify::new(),
             supports_stream_cancel: protocol_minor(protocol) >= STREAM_CANCEL_PROTOCOL_MINOR
                 && peer_capabilities & capabilities::STREAM_CANCEL != 0,
+            supports_flow_control: protocol_minor(protocol) >= FLOW_CONTROL_PROTOCOL_MINOR
+                && peer_capabilities & capabilities::FLOW_CONTROL != 0,
         });
         let transport = Self {
             inner: inner.clone(),
@@ -193,6 +240,34 @@ impl DeviceTransport {
                     }
                 };
                 let stream_id = frame.stream_id;
+                if frame.kind == FrameKind::StreamWindowUpdate {
+                    if !inner.supports_flow_control {
+                        tracing::warn!(stream_id, "unexpected stream window update from peer");
+                        break;
+                    }
+                    let update = match decode::<StreamWindowUpdate>(&frame.payload) {
+                        Ok(update) => update,
+                        Err(error) => {
+                            tracing::warn!(stream_id, %error, "invalid stream window update");
+                            break;
+                        }
+                    };
+                    let flow = inner
+                        .routes
+                        .lock()
+                        .await
+                        .get(&stream_id)
+                        .and_then(|route| route.flow.clone());
+                    if let Some(flow) = flow {
+                        if let Err(error) = flow.add(update.bytes as usize) {
+                            tracing::warn!(stream_id, %error, "invalid stream flow credit");
+                            break;
+                        }
+                    } else {
+                        tracing::debug!(stream_id, "dropping window update for inactive stream");
+                    }
+                    continue;
+                }
                 if frame.kind == FrameKind::StreamCancel {
                     let route = inner.routes.lock().await.remove(&stream_id);
                     if let Some(route) = route {
@@ -279,6 +354,10 @@ impl DeviceTransport {
             }
             let (sender, receiver) = mpsc::channel(ROUTE_CAPACITY);
             let (cancel_sender, cancel) = watch::channel(None);
+            let flow = self
+                .inner
+                .supports_flow_control
+                .then(|| Arc::new(FlowCredit::new()));
             let mut routes = self.inner.routes.lock().await;
             if self.inner.closed.load(Ordering::Acquire) {
                 bail!("device connection is closed");
@@ -291,6 +370,7 @@ impl DeviceTransport {
                 RouteSender {
                     sender,
                     cancel: cancel_sender,
+                    flow: flow.clone(),
                 },
             );
             return Ok(DeviceStream {
@@ -298,6 +378,7 @@ impl DeviceTransport {
                 transport: self.clone(),
                 receiver,
                 cancel,
+                flow,
                 completed: false,
             });
         }
@@ -333,6 +414,56 @@ impl DeviceStream {
         Ok(())
     }
 
+    async fn acquire_flow_credit(&self, bytes: usize) -> Result<()> {
+        let Some(flow) = &self.flow else {
+            return Ok(());
+        };
+        if bytes == 0 {
+            return Ok(());
+        }
+        if bytes > MAX_FLOW_CREDIT {
+            bail!("frame requires more than {MAX_FLOW_CREDIT} bytes of flow credit");
+        }
+        let mut cancel = self.cancel.clone();
+        loop {
+            let credit_ready = flow.notify.notified();
+            let closed = self.transport.inner.closed_notify.notified();
+            self.ensure_active()?;
+            if flow.try_take(bytes) {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = credit_ready => {}
+                _ = closed => self.ensure_active()?,
+                changed = cancel.changed() => {
+                    if changed.is_ok()
+                        && let Some(reason) = cancel.borrow().clone()
+                    {
+                        bail!(reason);
+                    }
+                    self.ensure_active()?;
+                }
+            }
+        }
+    }
+
+    pub(super) fn uses_flow_control(&self) -> bool {
+        self.flow.is_some()
+    }
+
+    pub(super) async fn grant_window(&self, bytes: usize) -> Result<()> {
+        if !self.uses_flow_control() || bytes == 0 {
+            return Ok(());
+        }
+        let bytes = u32::try_from(bytes).context("stream window update exceeds u32")?;
+        self.send(&frame(
+            FrameKind::StreamWindowUpdate,
+            self.id,
+            &StreamWindowUpdate { bytes },
+        )?)
+        .await
+    }
+
     pub(super) async fn send(&self, frame: &Frame) -> Result<()> {
         self.ensure_active()?;
         if frame.stream_id != self.id {
@@ -342,6 +473,10 @@ impl DeviceStream {
                 self.id
             );
         }
+        if frame.kind == FrameKind::FileChunk {
+            self.acquire_flow_credit(frame.payload.len()).await?;
+            self.ensure_active()?;
+        }
         let result = self.transport.send_frame(frame).await;
         self.ensure_active()?;
         result
@@ -349,6 +484,10 @@ impl DeviceStream {
 
     pub(super) async fn send_raw(&self, kind: FrameKind, payload: &[u8]) -> Result<()> {
         self.ensure_active()?;
+        if kind == FrameKind::FileChunk {
+            self.acquire_flow_credit(payload.len()).await?;
+            self.ensure_active()?;
+        }
         let result = self.transport.send_raw(kind, self.id, payload).await;
         self.ensure_active()?;
         result
@@ -424,7 +563,8 @@ impl Drop for DeviceStream {
 mod tests {
     use super::{DeviceTransport, ROUTE_CAPACITY, enqueue_write};
     use sidewire_protocol::{
-        FrameKind, SecureFrameReader, SecureFrameWriter, VERSION, capabilities, raw_frame,
+        FrameKind, SecureFrameReader, SecureFrameWriter, StreamWindowUpdate, VERSION, capabilities,
+        frame, raw_frame,
     };
     use tokio::{
         net::{TcpListener, TcpStream},
@@ -483,6 +623,125 @@ mod tests {
             .unwrap();
         assert_eq!(frame.kind, FrameKind::StreamCancel);
         assert_eq!(frame.stream_id, id);
+    }
+
+    #[tokio::test]
+    async fn flow_control_blocks_file_chunks_until_credit() {
+        let (client, server) = tcp_pair().await;
+        let transport = DeviceTransport::new(
+            client,
+            None,
+            VERSION,
+            capabilities::STREAM_CANCEL | capabilities::FLOW_CONTROL,
+        );
+        let stream = transport.open_stream().await.unwrap();
+        let stream_id = stream.id();
+        let (server_read, server_write) = server.into_split();
+        let mut reader = SecureFrameReader::new(server_read, None);
+        let mut writer = SecureFrameWriter::new(server_write, None);
+
+        let send = tokio::spawn(async move {
+            stream
+                .send_raw(FrameKind::FileChunk, b"data")
+                .await
+                .unwrap();
+        });
+        assert!(
+            timeout(Duration::from_millis(50), reader.read_frame())
+                .await
+                .is_err()
+        );
+        writer
+            .write_frame(
+                &frame(
+                    FrameKind::StreamWindowUpdate,
+                    stream_id,
+                    &StreamWindowUpdate { bytes: 3 },
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), reader.read_frame())
+                .await
+                .is_err()
+        );
+        writer
+            .write_frame(
+                &frame(
+                    FrameKind::StreamWindowUpdate,
+                    stream_id,
+                    &StreamWindowUpdate { bytes: 1 },
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let chunk = timeout(Duration::from_secs(1), reader.read_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.kind, FrameKind::FileChunk);
+        assert_eq!(chunk.payload, b"data");
+        send.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flow_control_wait_is_canceled_by_remote() {
+        let (client, server) = tcp_pair().await;
+        let transport = DeviceTransport::new(
+            client,
+            None,
+            VERSION,
+            capabilities::STREAM_CANCEL | capabilities::FLOW_CONTROL,
+        );
+        let stream = transport.open_stream().await.unwrap();
+        let stream_id = stream.id();
+        let (server_read, server_write) = server.into_split();
+        let mut reader = SecureFrameReader::new(server_read, None);
+        let mut writer = SecureFrameWriter::new(server_write, None);
+        let sending =
+            tokio::spawn(async move { stream.send_raw(FrameKind::FileChunk, b"blocked").await });
+        assert!(
+            timeout(Duration::from_millis(50), reader.read_frame())
+                .await
+                .is_err()
+        );
+        writer
+            .write_raw(FrameKind::StreamCancel, stream_id, b"stop")
+            .await
+            .unwrap();
+        let error = timeout(Duration::from_secs(1), sending)
+            .await
+            .expect("flow-control waiter did not wake after cancellation")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("stop"));
+    }
+
+    #[tokio::test]
+    async fn protocol_1_1_file_chunks_do_not_wait_for_flow_credit() {
+        let (client, server) = tcp_pair().await;
+        let transport = DeviceTransport::new(
+            client,
+            None,
+            0x0101,
+            capabilities::STREAM_CANCEL | capabilities::FLOW_CONTROL,
+        );
+        let stream = transport.open_stream().await.unwrap();
+        assert!(!stream.uses_flow_control());
+        stream
+            .send_raw(FrameKind::FileChunk, b"legacy")
+            .await
+            .unwrap();
+        let mut reader = SecureFrameReader::new(server, None);
+        let chunk = timeout(Duration::from_secs(1), reader.read_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.kind, FrameKind::FileChunk);
+        assert_eq!(chunk.payload, b"legacy");
     }
 
     #[tokio::test]

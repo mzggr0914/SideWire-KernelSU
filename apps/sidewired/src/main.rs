@@ -3,8 +3,8 @@ use clap::{Parser, ValueEnum};
 use sidewire_protocol::{
     ClipboardData, ClipboardSetRequest, DeviceId, ExecExit, ExecIdentity, ExecRequest, FileMeta,
     FilePullRequest, FilePushRequest, Frame, FrameKind, HelloAck, ProxyStartAck, ProxyStartRequest,
-    ProxyTokenMode, PtyOpenRequest, SecureFrameReader, SecureFrameWriter, SecurityMode, decode,
-    frame,
+    ProxyTokenMode, PtyOpenRequest, SecureFrameReader, SecureFrameWriter, SecurityMode,
+    StreamWindowUpdate, decode, frame,
 };
 #[cfg(target_os = "android")]
 use sidewire_protocol::{PtyCompleteRequest, PtyExit, PtyOpenAck, PtyResize};
@@ -26,6 +26,9 @@ const HOST_SILENCE_TIMEOUT_SECS: u64 = 45;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const CONNECTION_SETUP_TIMEOUT_SECS: u64 = 10;
 const STREAM_CANCEL_PROTOCOL_MINOR: u8 = 1;
+const FLOW_CONTROL_PROTOCOL_MINOR: u8 = 2;
+const FILE_FLOW_WINDOW: usize = 1024 * 1024;
+const FILE_FLOW_UPDATE_THRESHOLD: usize = FILE_FLOW_WINDOW / 2;
 const MAX_CLIPBOARD_TEXT: usize = 4 * 1024 * 1024;
 
 type StreamRoutes = Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Frame>>>>;
@@ -408,7 +411,8 @@ fn daemon_capabilities(clipboard_helper: Option<&str>) -> u64 {
         | sidewire_protocol::capabilities::PTY_COMPLETION
         | sidewire_protocol::capabilities::SECURE_PROXY
         | sidewire_protocol::capabilities::HEARTBEAT
-        | sidewire_protocol::capabilities::STREAM_CANCEL;
+        | sidewire_protocol::capabilities::STREAM_CANCEL
+        | sidewire_protocol::capabilities::FLOW_CONTROL;
     if clipboard_helper.is_some_and(|path| std::path::Path::new(path).is_file()) {
         capabilities |= sidewire_protocol::capabilities::CLIPBOARD;
     }
@@ -499,10 +503,18 @@ async fn serve(
     let supports_stream_cancel = sidewire_protocol::protocol_minor(negotiated_protocol)
         >= STREAM_CANCEL_PROTOCOL_MINOR
         && negotiated_capabilities & sidewire_protocol::capabilities::STREAM_CANCEL != 0;
+    let supports_flow_control = sidewire_protocol::protocol_minor(negotiated_protocol)
+        >= FLOW_CONTROL_PROTOCOL_MINOR
+        && negotiated_capabilities & sidewire_protocol::capabilities::FLOW_CONTROL != 0;
 
     let (reader_half, writer_half) = stream.into_split();
     let mut reader = SecureFrameReader::new(reader_half, noise.clone());
-    let writer = MuxWriter::new(writer_half, noise, supports_stream_cancel);
+    let writer = MuxWriter::new(
+        writer_half,
+        noise,
+        supports_stream_cancel,
+        supports_flow_control,
+    );
     let routes: StreamRoutes = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let cancels: StreamCancels = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let proxies = Arc::new(tokio::sync::Mutex::new(HashMap::<
@@ -532,6 +544,13 @@ async fn serve(
                 _ = writer.wait_failed() => bail!("device connection writer stopped"),
             };
             let stream_id = request.stream_id;
+            if request.kind == FrameKind::StreamWindowUpdate {
+                let update: StreamWindowUpdate = decode(&request.payload)?;
+                if !writer.add_flow_credit(stream_id, update.bytes)? {
+                    tracing::debug!(stream_id, "dropping late window update for inactive stream");
+                }
+                continue;
+            }
             if request.kind == FrameKind::StreamCancel {
                 writer.cancel_local(stream_id);
                 let routed = routes.lock().await.remove(&stream_id).is_some();
@@ -601,6 +620,7 @@ async fn serve(
                 }
                 FrameKind::PullRequest => {
                     let cancel = register_cancel(&cancels, stream_id).await?;
+                    writer.register_flow_stream(stream_id)?;
                     let writer = writer.clone();
                     let cancels = cancels.clone();
                     tokio::spawn(async move {
@@ -1019,6 +1039,22 @@ async fn file_size_for_identity(path: &str, identity: ExecIdentity) -> Result<u6
         .with_context(|| format!("parse size for {path}"))
 }
 
+async fn account_file_window(
+    writer: &MuxWriter,
+    stream_id: u32,
+    consumed: &mut usize,
+    bytes: usize,
+) -> Result<()> {
+    *consumed = consumed
+        .checked_add(bytes)
+        .context("file flow-control byte counter overflow")?;
+    if *consumed >= FILE_FLOW_UPDATE_THRESHOLD {
+        writer.send_window_update(stream_id, *consumed).await?;
+        *consumed = 0;
+    }
+    Ok(())
+}
+
 async fn handle_push(
     writer: &MuxWriter,
     stream_id: u32,
@@ -1038,6 +1074,10 @@ async fn handle_push(
                 &FileMeta { size: 0 },
             )?)
             .await?;
+        writer
+            .send_window_update(stream_id, FILE_FLOW_WINDOW)
+            .await?;
+        let mut window_consumed = 0usize;
         loop {
             let incoming = tokio::select! {
                 biased;
@@ -1049,7 +1089,16 @@ async fn handle_push(
                 bail!("unexpected stream {} during push", incoming.stream_id);
             }
             match incoming.kind {
-                FrameKind::FileChunk => file.write_all(&incoming.payload).await?,
+                FrameKind::FileChunk => {
+                    file.write_all(&incoming.payload).await?;
+                    account_file_window(
+                        writer,
+                        stream_id,
+                        &mut window_consumed,
+                        incoming.payload.len(),
+                    )
+                    .await?;
+                }
                 FrameKind::FileEnd => break,
                 _ => bail!("unexpected frame {:?} during push", incoming.kind),
             }
@@ -1107,6 +1156,10 @@ async fn handle_push(
             &FileMeta { size: 0 },
         )?)
         .await?;
+    writer
+        .send_window_update(stream_id, FILE_FLOW_WINDOW)
+        .await?;
+    let mut window_consumed = 0usize;
 
     let transfer_result: Result<()> = async {
         loop {
@@ -1120,7 +1173,16 @@ async fn handle_push(
                 bail!("unexpected stream {} during push", incoming.stream_id);
             }
             match incoming.kind {
-                FrameKind::FileChunk => child_stdin.write_all(&incoming.payload).await?,
+                FrameKind::FileChunk => {
+                    child_stdin.write_all(&incoming.payload).await?;
+                    account_file_window(
+                        writer,
+                        stream_id,
+                        &mut window_consumed,
+                        incoming.payload.len(),
+                    )
+                    .await?;
+                }
                 FrameKind::FileEnd => break,
                 _ => bail!("unexpected frame {:?} during push", incoming.kind),
             }
