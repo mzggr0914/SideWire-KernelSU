@@ -28,6 +28,7 @@ const $=id=>document.getElementById(id);
 let loadedSecurity='secure';
 let pinTimer=null;
 async function sh(cmd){const r=await exec(cmd);if(r.errno!==0)throw new Error(r.stderr||`errno ${r.errno}`);return (r.stdout||'').trim();}
+function shellQuote(value){return "'"+String(value).replace(/'/g,"'\"'\"'")+"'";}
 async function get(k,f=''){try{return await sh(`${ctl} get ${k}`)||f}catch{return f}}
 function renderSecurity(){const insecure=$('security').value==='insecure';$('insecureWarning').classList.toggle('hidden',!insecure);}
 function stripAnsi(text){return text.replace(/\x1B\[[0-?]*[ -\/]*[@-~]/g,'');}
@@ -55,7 +56,9 @@ async function act(action){try{await sh(`${ctl} ${action}`);toast(`${action} OK`
 async function saveConfig(confirmed=false){
   if($('security').value==='insecure'&&loadedSecurity!=='insecure'&&!confirmed){$('insecureModal').classList.remove('hidden');return;}
   try{
-    for(const k of ['host','port','name','mode','security','autostart'])await sh(`${ctl} set ${k} ${JSON.stringify($(k).value)}`);
+    const keys=['host','port','name','mode','security','autostart'];
+    const args=keys.flatMap(k=>[k,shellQuote($(k).value)]).join(' ');
+    await sh(`${ctl} set-many ${args}`);
     loadedSecurity=$('security').value;renderSecurity();toast('Saved. Restart SideWire to apply.');await refresh();
   }catch(e){toast(e.message)}
 }

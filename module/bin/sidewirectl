@@ -47,7 +47,9 @@ provision_clipboard_helper(){
   chmod 0750 "$SHELL_STATE_DIR" 2>/dev/null
   chcon u:object_r:shell_data_file:s0 "$SHELL_STATE_DIR" 2>/dev/null || true
   if [ -f "$CLIPBOARD_SOURCE" ]; then
-    cp "$CLIPBOARD_SOURCE" "$CLIPBOARD_HELPER" || return 1
+    if [ ! -f "$CLIPBOARD_HELPER" ] || ! cmp -s "$CLIPBOARD_SOURCE" "$CLIPBOARD_HELPER"; then
+      cp "$CLIPBOARD_SOURCE" "$CLIPBOARD_HELPER" || return 1
+    fi
     chown 0:2000 "$CLIPBOARD_HELPER" 2>/dev/null
     chmod 0440 "$CLIPBOARD_HELPER" 2>/dev/null
     chcon u:object_r:shell_data_file:s0 "$CLIPBOARD_HELPER" 2>/dev/null || true
@@ -58,6 +60,16 @@ provision_clipboard_helper(){
 
 get(){ ksud module config get "$1" 2>/dev/null; }
 setv(){ ksud module config set "$1" "$2" >/dev/null; }
+set_many(){
+  [ $(( $# % 2 )) -eq 0 ] || { echo "set-many expects KEY VALUE pairs" >&2; return 2; }
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      host|port|name|mode|security|autostart|pairing_port) setv "$1" "$2" || return $?;;
+      *) echo "unsupported SideWire setting: $1" >&2; return 2;;
+    esac
+    shift 2
+  done
+}
 write_config(){
   ensure_state
   provision_clipboard_helper || true
@@ -153,7 +165,8 @@ status(){
 }
 case "$1" in
   get) get "$2";;
-  set) setv "$2" "$3"; write_config;;
+  set) setv "$2" "$3";;
+  set-many) shift; set_many "$@";;
   start) request_action start;;
   stop) request_action stop;;
   restart) request_action restart;;
@@ -167,5 +180,5 @@ case "$1" in
   unpair) unpair "$2";;
   unpair-all) unpair_all;;
   log) [ -f "$LOGFILE" ] && tail -n 120 "$LOGFILE" 2>/dev/null || true;;
-  *) echo "usage: sidewirectl get|set|start|stop|restart|status|config|pair|paired|unpair|unpair-all|log"; exit 2;;
+  *) echo "usage: sidewirectl get|set|set-many|start|stop|restart|status|config|pair|paired|unpair|unpair-all|log"; exit 2;;
 esac
