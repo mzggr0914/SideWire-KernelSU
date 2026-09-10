@@ -3,6 +3,8 @@ use crate::client::{exec_control, list_devices, request_control};
 use std::path::{Component, Path};
 
 const MAX_TRANSFER_JOBS: usize = 16;
+const MAX_MKDIR_BATCH_PATHS: usize = 64;
+const MAX_MKDIR_BATCH_BYTES: usize = 32 * 1024;
 
 async fn join_transfer(
     transfers: &mut tokio::task::JoinSet<Result<u64>>,
@@ -103,22 +105,37 @@ async fn pull_file(
     }
 }
 
-async fn ensure_remote_dir(
+async fn ensure_remote_dirs(
     control: &str,
     device: Option<String>,
     run_as: RunAs,
-    path: &str,
+    paths: &[String],
 ) -> Result<()> {
-    let (_, stderr, code) = exec_control(
-        control,
-        device,
-        run_as,
-        "/system/bin/mkdir",
-        vec!["-p".into(), path.into()],
-    )
-    .await?;
-    if code.unwrap_or(1) != 0 {
-        bail!("mkdir {path}: {}", stderr.trim());
+    let mut start = 0usize;
+    while start < paths.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < paths.len() && end - start < MAX_MKDIR_BATCH_PATHS {
+            let next = paths[end].len().saturating_add(1);
+            if end > start && bytes.saturating_add(next) > MAX_MKDIR_BATCH_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(next);
+            end += 1;
+        }
+        let mut args = Vec::with_capacity(end - start + 1);
+        args.push("-p".to_owned());
+        args.extend(paths[start..end].iter().cloned());
+        let (_, stderr, code) =
+            exec_control(control, device.clone(), run_as, "/system/bin/mkdir", args).await?;
+        if code.unwrap_or(1) != 0 {
+            bail!(
+                "mkdir batch for {} paths failed: {}",
+                end - start,
+                stderr.trim()
+            );
+        }
+        start = end;
     }
     Ok(())
 }
@@ -224,12 +241,9 @@ async fn push_path(
         );
     }
 
-    ensure_remote_dir(control, device.clone(), run_as, &remote).await?;
     let mut stack = vec![local.clone()];
-    let mut files = 0u64;
-    let mut bytes = 0u64;
-    let mut directories = 1u64;
-    let mut transfers = tokio::task::JoinSet::new();
+    let mut remote_dirs = vec![remote.clone()];
+    let mut pending_files = Vec::new();
     while let Some(directory) = stack.pop() {
         let mut entries = tokio::fs::read_dir(&directory).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -241,20 +255,27 @@ async fn push_path(
                 bail!("recursive push does not follow symlink {}", path.display());
             }
             if file_type.is_dir() {
-                ensure_remote_dir(control, device.clone(), run_as, &remote_path).await?;
-                directories += 1;
+                remote_dirs.push(remote_path);
                 stack.push(path);
             } else if file_type.is_file() {
-                while transfers.len() >= jobs {
-                    join_transfer(&mut transfers, &mut files, &mut bytes).await?;
-                }
-                let control = control.to_owned();
-                let device = device.clone();
-                transfers.spawn(async move {
-                    push_file(&control, device, run_as, &path, remote_path).await
-                });
+                pending_files.push((path, remote_path));
             }
         }
+    }
+
+    ensure_remote_dirs(control, device.clone(), run_as, &remote_dirs).await?;
+    let directories = remote_dirs.len() as u64;
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut transfers = tokio::task::JoinSet::new();
+    for (path, remote_path) in pending_files {
+        while transfers.len() >= jobs {
+            join_transfer(&mut transfers, &mut files, &mut bytes).await?;
+        }
+        let control = control.to_owned();
+        let device = device.clone();
+        transfers
+            .spawn(async move { push_file(&control, device, run_as, &path, remote_path).await });
     }
     drain_transfers(&mut transfers, &mut files, &mut bytes).await?;
     Ok(format!(
