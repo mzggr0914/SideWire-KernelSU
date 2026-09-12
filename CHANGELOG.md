@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.0
+
 - add protocol 1.2 receive-window flow control for file chunks while preserving protocol 1.1 fallback behavior
 - parallelize recursive file transfers with bounded `--jobs` concurrency and batch remote directory creation
 - reduce transport hot-path contention by removing async locks from per-frame stream routing
