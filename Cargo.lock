@@ -1063,7 +1063,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sidewire"
-version = "0.9.9"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "sidewire-protocol"
-version = "0.9.9"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "sidewired"
-version = "0.9.9"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
